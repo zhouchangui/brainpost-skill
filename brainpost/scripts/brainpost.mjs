@@ -2,7 +2,14 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  readFile,
+  rename,
+  stat,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -11,10 +18,14 @@ const uuid =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const tokenPattern = /^ikt1_[A-Za-z0-9_-]{43}$/;
 const captureStatuses = new Set([
+  "received",
+  "planning",
   "accepted",
   "processing",
   "ready",
+  "success",
   "partial",
+  "refused",
   "failed",
 ]);
 
@@ -29,9 +40,8 @@ class BrainPostError extends Error {
 
 function usage() {
   return `Usage:
-  node brainpost.mjs configure [--api URL] [--project UUID] < token.txt
-  node brainpost.mjs projects
-  node brainpost.mjs capture (--url URL | --file PATH | --stdin) [--project UUID] [--idempotency-key UUID] [--cloud]
+  node brainpost.mjs configure [--api URL] < token.txt
+  node brainpost.mjs capture (--url URL | --file PATH | --stdin) [--idempotency-key UUID]
 `;
 }
 
@@ -40,7 +50,11 @@ function options(args, allowed, booleans = new Set()) {
   for (let index = 0; index < args.length; index += 1) {
     const name = args[index];
     if (!name?.startsWith("--") || !allowed.has(name) || result.has(name)) {
-      throw new BrainPostError("usage_error", `Invalid option: ${name ?? ""}`, 2);
+      throw new BrainPostError(
+        "usage_error",
+        `Invalid option: ${name ?? ""}`,
+        2,
+      );
     }
     if (booleans.has(name)) {
       result.set(name, true);
@@ -77,13 +91,6 @@ function apiBase(value) {
   }
 }
 
-function project(value) {
-  if (!uuid.test(value)) {
-    throw new BrainPostError("configuration_error", "Project must be a UUID.", 3);
-  }
-  return value;
-}
-
 function identityToken(value) {
   if (!tokenPattern.test(value)) {
     throw new BrainPostError(
@@ -111,9 +118,15 @@ async function readStdin(maxBytes) {
     chunks.push(bytes);
   }
   try {
-    return new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
+    return new TextDecoder("utf-8", { fatal: true }).decode(
+      Buffer.concat(chunks),
+    );
   } catch {
-    throw new BrainPostError("input_error", "Input must be valid UTF-8 text.", 4);
+    throw new BrainPostError(
+      "input_error",
+      "Input must be valid UTF-8 text.",
+      4,
+    );
   }
 }
 
@@ -131,7 +144,6 @@ async function loadConfig(path) {
     return {
       apiUrl: apiBase(value?.apiUrl),
       token: identityToken(value?.token),
-      projectId: project(value?.projectId),
     };
   } catch (error) {
     if (error instanceof BrainPostError) throw error;
@@ -196,7 +208,11 @@ async function request(config, path, init = {}) {
       },
     });
   } catch {
-    throw new BrainPostError("network_error", "BrainPost could not be reached.", 5);
+    throw new BrainPostError(
+      "network_error",
+      "BrainPost could not be reached.",
+      5,
+    );
   }
   const value = await response.json().catch(() => null);
   if (!response.ok) {
@@ -210,69 +226,61 @@ async function request(config, path, init = {}) {
   return value;
 }
 
-async function targets(config) {
-  const value = await request(config, "/v1/targets");
+async function defaultVault(config) {
+  const value = await request(config, "/v1/default-vault");
+  if (value?.defaultVault === null) return null;
+  const vault = value?.defaultVault;
   if (
-    !Array.isArray(value) ||
-    value.some(
-      (item) =>
-        !uuid.test(typeof item?.id === "string" ? item.id : "") ||
-        typeof item?.name !== "string" ||
-        item.status !== "active",
-    )
+    !vault ||
+    !uuid.test(typeof vault.projectId === "string" ? vault.projectId : "") ||
+    typeof vault.projectName !== "string" ||
+    vault.projectStatus !== "active"
   ) {
     throw new BrainPostError(
       "invalid_response",
-      "BrainPost returned invalid Vault targets.",
+      "BrainPost returned an invalid default Vault.",
       5,
     );
   }
-  return value.map(({ id, name }) => ({ id, name }));
+  return {
+    projectId: vault.projectId,
+    projectName: vault.projectName,
+    defaultVersion: vault.defaultVersion,
+  };
 }
 
 async function configure(args, configPath) {
-  const parsed = options(args, new Set(["--api", "--project"]));
+  const parsed = options(args, new Set(["--api"]));
   const apiUrl = apiBase(
     parsed.get("--api") ??
       process.env.BRAINPOST_API_URL ??
       "https://brainpost.me/api",
   );
   const token = identityToken((await readStdin(512)).trim());
-  const available = await targets({ apiUrl, token });
-  const requested = parsed.get("--project");
-  const projectId = requested === undefined ? available[0]?.id : project(requested);
-  if (
-    !projectId ||
-    (requested === undefined && available.length !== 1) ||
-    !available.some(({ id }) => id === projectId)
-  ) {
+  const vault = await defaultVault({ apiUrl, token });
+  if (!vault) {
     throw new BrainPostError(
-      "project_required",
-      "Choose one activated BrainPost Vault and configure again with --project UUID.",
+      "default_vault_required",
+      "Open and authenticate an Obsidian Vault before submitting content.",
       3,
-      { projects: available },
+      { setupUrl: `${apiUrl.replace(/\/api$/u, "")}/#account` },
     );
   }
-  await saveConfig(configPath, { apiUrl, token, projectId });
+  await saveConfig(configPath, { apiUrl, token });
   process.stdout.write(
-    `${JSON.stringify({ ok: true, config: { apiUrl, projectId, tokenConfigured: true } })}\n`,
+    `${JSON.stringify({ ok: true, config: { apiUrl, defaultVault: vault.projectName, tokenConfigured: true } })}\n`,
   );
 }
 
 async function capture(args, configPath) {
   const parsed = options(
     args,
-    new Set([
-      "--url",
-      "--file",
-      "--stdin",
-      "--project",
-      "--idempotency-key",
-      "--cloud",
-    ]),
-    new Set(["--stdin", "--cloud"]),
+    new Set(["--url", "--file", "--stdin", "--idempotency-key"]),
+    new Set(["--stdin"]),
   );
-  const modes = ["--url", "--file", "--stdin"].filter((name) => parsed.has(name));
+  const modes = ["--url", "--file", "--stdin"].filter((name) =>
+    parsed.has(name),
+  );
   if (modes.length !== 1) {
     throw new BrainPostError(
       "usage_error",
@@ -281,28 +289,18 @@ async function capture(args, configPath) {
     );
   }
   const config = (await loadConfig(configPath)) ?? configurationRequired();
-  const projectId = parsed.has("--project")
-    ? project(parsed.get("--project"))
-    : config.projectId;
-  const available = await targets(config);
-  if (!available.some(({ id }) => id === projectId)) {
-    throw new BrainPostError(
-      "project_not_activated",
-      "Activate the target Vault in Obsidian before submitting.",
-      3,
-    );
-  }
 
   let body;
   if (parsed.has("--url")) {
     const value = parsed.get("--url");
     try {
       const url = new URL(value);
-      if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error();
+      if (url.protocol !== "http:" && url.protocol !== "https:")
+        throw new Error();
     } catch {
       throw new BrainPostError("input_error", "URL must use HTTP(S).", 4);
     }
-    body = { projectId, kind: "url", url: value, client: "skill" };
+    body = { url: value, client: "skill" };
   } else {
     let content;
     if (parsed.has("--file")) {
@@ -311,7 +309,11 @@ async function capture(args, configPath) {
       try {
         details = await stat(path);
       } catch {
-        throw new BrainPostError("input_error", "Markdown file could not be read.", 4);
+        throw new BrainPostError(
+          "input_error",
+          "Markdown file could not be read.",
+          4,
+        );
       }
       if (!details.isFile() || details.size > maxContentBytes) {
         throw new BrainPostError(
@@ -321,33 +323,44 @@ async function capture(args, configPath) {
         );
       }
       try {
-        content = new TextDecoder("utf-8", { fatal: true }).decode(await readFile(path));
+        content = new TextDecoder("utf-8", { fatal: true }).decode(
+          await readFile(path),
+        );
       } catch {
-        throw new BrainPostError("input_error", "Markdown must be valid UTF-8 text.", 4);
+        throw new BrainPostError(
+          "input_error",
+          "Markdown must be valid UTF-8 text.",
+          4,
+        );
       }
     } else {
       content = await readStdin(maxContentBytes);
     }
     if (!content.trim()) {
-      throw new BrainPostError("input_error", "Input content cannot be empty.", 4);
+      throw new BrainPostError(
+        "input_error",
+        "Input content cannot be empty.",
+        4,
+      );
     }
     body = {
-      projectId,
-      kind: parsed.has("--file") ? "markdown" : "text",
       content,
       client: "skill",
     };
   }
-  if (parsed.has("--cloud")) body.processingMode = "cloud";
 
   const suppliedKey = parsed.get("--idempotency-key");
   if (suppliedKey !== undefined && !uuid.test(suppliedKey)) {
-    throw new BrainPostError("usage_error", "Idempotency key must be a UUID.", 2);
+    throw new BrainPostError(
+      "usage_error",
+      "Idempotency key must be a UUID.",
+      2,
+    );
   }
   const idempotencyKey = suppliedKey ?? randomUUID();
   let value;
   try {
-    value = await request(config, "/v1/captures", {
+    value = await request(config, "/v1/intakes", {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -361,16 +374,19 @@ async function capture(args, configPath) {
     }
     throw error;
   }
-  if (!uuid.test(value?.id ?? "") || !captureStatuses.has(value?.status)) {
+  if (
+    !uuid.test(value?.intakeId ?? "") ||
+    !captureStatuses.has(value?.status)
+  ) {
     throw new BrainPostError(
       "invalid_response",
-      "BrainPost returned an invalid capture result.",
+      "BrainPost returned an invalid Intake result.",
       5,
       { idempotencyKey },
     );
   }
   process.stdout.write(
-    `${JSON.stringify({ ok: true, capture: { id: value.id, status: value.status } })}\n`,
+    `${JSON.stringify({ ok: true, intake: { id: value.intakeId, status: value.status, statusUrl: value.statusUrl } })}\n`,
   );
 }
 
@@ -381,11 +397,6 @@ async function main(args) {
   const [command, ...rest] = args;
   if (command === "configure") return configure(rest, configPath);
   if (command === "capture") return capture(rest, configPath);
-  if (command === "projects" && rest.length === 0) {
-    const config = (await loadConfig(configPath)) ?? configurationRequired();
-    process.stdout.write(`${JSON.stringify({ ok: true, projects: await targets(config) })}\n`);
-    return;
-  }
   if (command === "help" || command === "--help" || command === undefined) {
     process.stdout.write(usage());
     return;
@@ -397,7 +408,10 @@ main(process.argv.slice(2)).catch((error) => {
   const failure =
     error instanceof BrainPostError
       ? error
-      : new BrainPostError("unexpected_error", "BrainPost could not complete the request.");
+      : new BrainPostError(
+          "unexpected_error",
+          "BrainPost could not complete the request.",
+        );
   process.stderr.write(
     `${JSON.stringify({
       ok: false,

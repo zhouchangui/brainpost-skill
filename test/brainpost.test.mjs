@@ -40,15 +40,6 @@ test("BrainPost Skill submits a complete Markdown file without exposing its toke
 
   let captureRequest;
   const server = createServer(async (request, response) => {
-    if (request.url === "/v1/targets") {
-      response.setHeader("content-type", "application/json");
-      response.end(
-        JSON.stringify([
-          { id: projectId, name: "Work", status: "active" },
-        ]),
-      );
-      return;
-    }
     let body = "";
     request.setEncoding("utf8");
     for await (const chunk of request) body += chunk;
@@ -60,8 +51,9 @@ test("BrainPost Skill submits a complete Markdown file without exposing its toke
     response.writeHead(202, { "content-type": "application/json" });
     response.end(
       JSON.stringify({
-        id: "50000000-0000-4000-8000-000000000001",
-        status: "accepted",
+        intakeId: "50000000-0000-4000-8000-000000000001",
+        status: "planning",
+        statusUrl: "/v1/intakes/50000000-0000-4000-8000-000000000001",
       }),
     );
   });
@@ -69,11 +61,9 @@ test("BrainPost Skill submits a complete Markdown file without exposing its toke
   t.after(() => new Promise((resolve) => server.close(resolve)));
   const address = server.address();
   const apiUrl = `http://127.0.0.1:${address.port}`;
-  await writeFile(
-    config,
-    `${JSON.stringify({ apiUrl, token, projectId })}\n`,
-    { mode: 0o600 },
-  );
+  await writeFile(config, `${JSON.stringify({ apiUrl, token })}\n`, {
+    mode: 0o600,
+  });
 
   const result = await run(["capture", "--file", markdown], {
     BRAINPOST_CONFIG: config,
@@ -82,14 +72,13 @@ test("BrainPost Skill submits a complete Markdown file without exposing its toke
   assert.equal(result.code, 0, result.stderr);
   assert.deepEqual(JSON.parse(result.stdout), {
     ok: true,
-    capture: {
+    intake: {
       id: "50000000-0000-4000-8000-000000000001",
-      status: "accepted",
+      status: "planning",
+      statusUrl: "/v1/intakes/50000000-0000-4000-8000-000000000001",
     },
   });
   assert.deepEqual(captureRequest.body, {
-    projectId,
-    kind: "markdown",
     content,
     client: "skill",
   });
@@ -109,11 +98,16 @@ test("BrainPost Skill configures the shared token and submits stdin or a URL", a
     for await (const chunk of request) body += chunk;
     const path = new URL(request.url, "http://local.test").pathname;
     response.setHeader("content-type", "application/json");
-    if (path === "/v1/targets") {
+    if (path === "/v1/default-vault") {
       response.end(
-        JSON.stringify([
-          { id: projectId, name: "Work", status: "active" },
-        ]),
+        JSON.stringify({
+          defaultVault: {
+            projectId,
+            projectName: "Work",
+            projectStatus: "active",
+            defaultVersion: 1,
+          },
+        }),
       );
       return;
     }
@@ -121,8 +115,9 @@ test("BrainPost Skill configures the shared token and submits stdin or a URL", a
     response.writeHead(202);
     response.end(
       JSON.stringify({
-        id: "50000000-0000-4000-8000-000000000002",
-        status: "accepted",
+        intakeId: "50000000-0000-4000-8000-000000000002",
+        status: "planning",
+        statusUrl: "/v1/intakes/50000000-0000-4000-8000-000000000002",
       }),
     );
   });
@@ -142,23 +137,17 @@ test("BrainPost Skill configures the shared token and submits stdin or a URL", a
   assert.equal(configured.code, 0, configured.stderr);
   assert.deepEqual(JSON.parse(configured.stdout), {
     ok: true,
-    config: { apiUrl, projectId, tokenConfigured: true },
+    config: { apiUrl, defaultVault: "Work", tokenConfigured: true },
   });
   assert.equal(text.code, 0, text.stderr);
   assert.equal(url.code, 0, url.stderr);
   assert.deepEqual(captureRequests, [
-    { projectId, kind: "text", content: "一段正文\n", client: "skill" },
-    {
-      projectId,
-      kind: "url",
-      url: "https://example.com/article",
-      client: "skill",
-    },
+    { content: "一段正文\n", client: "skill" },
+    { url: "https://example.com/article", client: "skill" },
   ]);
   assert.deepEqual(JSON.parse(await readFile(config, "utf8")), {
     apiUrl,
     token,
-    projectId,
   });
   if (process.platform !== "win32") {
     assert.equal((await stat(config)).mode & 0o777, 0o600);
