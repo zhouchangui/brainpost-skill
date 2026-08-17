@@ -1,0 +1,4 @@
+interface:
+  display_name: "BrainPost"
+  short_description: "Save links, text, and Markdown to BrainPost"
+  default_prompt: "Use $brainpost to save this link or content to my BrainPost Vault."
