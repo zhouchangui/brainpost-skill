@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
   readFile,
@@ -11,9 +11,46 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, extname, isAbsolute, join } from "node:path";
 
 const maxContentBytes = 262_144;
+const maxFileBytes = 100 * 1024 * 1024;
+const documentExtensions = new Set([
+  ".csv",
+  ".doc",
+  ".docm",
+  ".docx",
+  ".epub",
+  ".odp",
+  ".ods",
+  ".odt",
+  ".pdf",
+  ".pot",
+  ".pps",
+  ".ppsm",
+  ".ppsx",
+  ".ppt",
+  ".pptm",
+  ".pptx",
+  ".rtf",
+  ".xls",
+  ".xlsb",
+  ".xlsm",
+  ".xlsx",
+]);
+const mediaTypes = {
+  ".csv": "text/csv",
+  ".doc": "application/msword",
+  ".docx":
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".pdf": "application/pdf",
+  ".ppt": "application/vnd.ms-powerpoint",
+  ".pptx":
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".rtf": "application/rtf",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+};
 const uuid =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const tokenPattern = /^ikt1_[A-Za-z0-9_-]{43}$/;
@@ -216,10 +253,17 @@ async function request(config, path, init = {}) {
   }
   const value = await response.json().catch(() => null);
   if (!response.ok) {
+    const code = value?.error?.code ?? "api_error";
     throw new BrainPostError(
-      value?.error?.code ?? "api_error",
+      code,
       value?.error?.message ?? "BrainPost rejected the request.",
-      5,
+      [
+        "invalid_file_artifact",
+        "file_artifact_mismatch",
+        "file_artifact_expired",
+      ].includes(code)
+        ? 4
+        : 5,
       value?.error?.details,
     );
   }
@@ -258,18 +302,106 @@ async function configure(args, configPath) {
   );
   const token = identityToken((await readStdin(512)).trim());
   const vault = await defaultVault({ apiUrl, token });
-  if (!vault) {
-    throw new BrainPostError(
-      "default_vault_required",
-      "Open and authenticate an Obsidian Vault before submitting content.",
-      3,
-      { setupUrl: `${apiUrl.replace(/\/api$/u, "")}/#account` },
-    );
-  }
   await saveConfig(configPath, { apiUrl, token });
   process.stdout.write(
-    `${JSON.stringify({ ok: true, config: { apiUrl, defaultVault: vault.projectName, tokenConfigured: true } })}\n`,
+    `${JSON.stringify({ ok: true, config: { apiUrl, defaultVault: vault?.projectName ?? null, pendingDelivery: !vault, tokenConfigured: true } })}\n`,
   );
+}
+
+async function submitDocumentFile(config, path, idempotencyKey) {
+  if (!isAbsolute(path)) {
+    throw new BrainPostError(
+      "input_error",
+      "Document path must be absolute.",
+      4,
+    );
+  }
+  const filename = basename(path);
+  const extension = extname(filename).toLowerCase();
+  if (!documentExtensions.has(extension)) {
+    throw new BrainPostError(
+      "input_error",
+      "File type is not supported for document conversion.",
+      4,
+    );
+  }
+  let details;
+  try {
+    details = await stat(path);
+  } catch {
+    throw new BrainPostError("input_error", "Document could not be read.", 4);
+  }
+  if (!details.isFile() || details.size < 1 || details.size > maxFileBytes) {
+    throw new BrainPostError(
+      "input_error",
+      "Document must be a regular file between 1 byte and 100 MB.",
+      4,
+    );
+  }
+  const bytes = await readFile(path).catch(() => {
+    throw new BrainPostError("input_error", "Document could not be read.", 4);
+  });
+  const mediaType = mediaTypes[extension] ?? "application/octet-stream";
+  try {
+    const authorization = await request(config, "/v1/file-intakes", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": idempotencyKey,
+      },
+      body: JSON.stringify({
+        filename,
+        mediaType,
+        byteSize: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      }),
+    });
+    if (
+      !uuid.test(authorization?.id ?? "") ||
+      authorization?.uploadPath !== `/v1/file-uploads/${authorization.id}`
+    ) {
+      throw new BrainPostError(
+        "invalid_response",
+        "BrainPost returned an invalid file authorization.",
+        5,
+      );
+    }
+    await request(config, authorization.uploadPath, {
+      method: "PUT",
+      headers: { "content-type": mediaType },
+      body: bytes,
+    });
+    const capture = await request(
+      config,
+      `/v1/file-intakes/${authorization.id}/commit`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": idempotencyKey,
+        },
+        body: JSON.stringify({ client: "skill" }),
+      },
+    );
+    if (
+      !uuid.test(capture?.id ?? "") ||
+      !captureStatuses.has(capture?.status)
+    ) {
+      throw new BrainPostError(
+        "invalid_response",
+        "BrainPost returned an invalid file Capture.",
+        5,
+      );
+    }
+    process.stdout.write(
+      `${JSON.stringify({ ok: true, file: { captureId: capture.id, filename, status: capture.status } })}\n`,
+    );
+  } catch (error) {
+    if (error instanceof BrainPostError) {
+      error.details = { ...error.details, idempotencyKey };
+    }
+    throw error;
+  }
 }
 
 async function capture(args, configPath) {
@@ -289,6 +421,15 @@ async function capture(args, configPath) {
     );
   }
   const config = (await loadConfig(configPath)) ?? configurationRequired();
+  const suppliedKey = parsed.get("--idempotency-key");
+  if (suppliedKey !== undefined && !uuid.test(suppliedKey)) {
+    throw new BrainPostError(
+      "usage_error",
+      "Idempotency key must be a UUID.",
+      2,
+    );
+  }
+  const idempotencyKey = suppliedKey ?? randomUUID();
 
   let body;
   if (parsed.has("--url")) {
@@ -305,6 +446,23 @@ async function capture(args, configPath) {
     let content;
     if (parsed.has("--file")) {
       const path = parsed.get("--file");
+      if (documentExtensions.has(extname(path).toLowerCase())) {
+        return submitDocumentFile(config, path, idempotencyKey);
+      }
+      if (!isAbsolute(path)) {
+        throw new BrainPostError(
+          "input_error",
+          "Markdown path must be absolute.",
+          4,
+        );
+      }
+      if (![".md", ".markdown"].includes(extname(path).toLowerCase())) {
+        throw new BrainPostError(
+          "input_error",
+          "Use --file with Markdown or a supported document type.",
+          4,
+        );
+      }
       let details;
       try {
         details = await stat(path);
@@ -349,15 +507,6 @@ async function capture(args, configPath) {
     };
   }
 
-  const suppliedKey = parsed.get("--idempotency-key");
-  if (suppliedKey !== undefined && !uuid.test(suppliedKey)) {
-    throw new BrainPostError(
-      "usage_error",
-      "Idempotency key must be a UUID.",
-      2,
-    );
-  }
-  const idempotencyKey = suppliedKey ?? randomUUID();
   let value;
   try {
     value = await request(config, "/v1/intakes", {
