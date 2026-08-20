@@ -17,6 +17,7 @@ The bundled script can report the current membership, completed and active tasks
 ```bash
 node brainpost/scripts/brainpost.mjs capabilities
 node brainpost/scripts/brainpost.mjs status --intake <UUID>
+node brainpost/scripts/brainpost.mjs status --capture <UUID>
 ```
 
 ## Verify

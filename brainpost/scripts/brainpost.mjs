@@ -64,6 +64,11 @@ const captureStatuses = new Set([
   "refused",
   "failed",
 ]);
+const intakeStatuses = new Set([
+  ...captureStatuses,
+  "rate_limited",
+  "capacity_limited",
+]);
 const deliveryStatuses = new Set([
   "processing",
   "awaiting_vault",
@@ -80,6 +85,8 @@ const stableFailureReasons = new Set([
   "membership_file_not_supported",
   "processing_deadline_exceeded",
   "processing_failed",
+  "rate_limited",
+  "capacity_limited",
   "recent_failure_limit_reached",
 ]);
 
@@ -96,7 +103,7 @@ function usage() {
   return `Usage:
   node brainpost.mjs configure [--api URL] < token.txt
   node brainpost.mjs capabilities
-  node brainpost.mjs status --intake UUID
+  node brainpost.mjs status (--intake UUID | --capture UUID)
   node brainpost.mjs capture (--url URL | --file PATH | --stdin) [--idempotency-key UUID]
 `;
 }
@@ -432,16 +439,45 @@ function stableReason(value, fallback) {
 }
 
 async function showStatus(args, configPath) {
-  const parsed = options(args, new Set(["--intake"]));
-  const intakeId = parsed.get("--intake") ?? "";
-  if (!uuid.test(intakeId)) {
-    throw new BrainPostError("usage_error", "Intake ID must be a UUID.", 2);
+  const parsed = options(args, new Set(["--intake", "--capture"]));
+  const modes = ["--intake", "--capture"].filter((name) => parsed.has(name));
+  if (modes.length !== 1 || !uuid.test(parsed.get(modes[0]) ?? "")) {
+    throw new BrainPostError(
+      "usage_error",
+      "Choose one valid Intake or Capture UUID.",
+      2,
+    );
   }
+  const kind = modes[0] === "--capture" ? "capture" : "intake";
+  const id = parsed.get(modes[0]);
   const config = (await loadConfig(configPath)) ?? configurationRequired();
-  const value = await request(config, `/v1/intakes/${intakeId}`);
+  const value = await request(config, `/v1/${kind}s/${id}`);
+  if (kind === "capture") {
+    if (value?.id !== id || !captureStatuses.has(value?.status)) {
+      throw new BrainPostError(
+        "invalid_response",
+        "BrainPost returned an invalid Capture status.",
+        5,
+      );
+    }
+    process.stdout.write(
+      `${JSON.stringify({
+        ok: true,
+        capture: {
+          id,
+          status: value.status,
+          failureReason: stableReason(
+            value.failureReason,
+            "processing_failed",
+          ),
+        },
+      })}\n`,
+    );
+    return;
+  }
   if (
-    value?.id !== intakeId ||
-    !captureStatuses.has(value?.status) ||
+    value?.id !== id ||
+    !intakeStatuses.has(value?.status) ||
     !deliveryStatuses.has(value?.deliveryStatus) ||
     typeof value?.retryable !== "boolean"
   ) {
@@ -455,7 +491,7 @@ async function showStatus(args, configPath) {
     `${JSON.stringify({
       ok: true,
       intake: {
-        id: intakeId,
+        id,
         status: value.status,
         failureReason: stableReason(value.failureReason, "processing_failed"),
         refusalReason: stableReason(value.refusalReason, "refused"),

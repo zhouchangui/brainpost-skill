@@ -286,25 +286,34 @@ test("legacy upgrade handoff keeps only its validated account URL", async (t) =>
   assert.equal("upgradeUrl" in JSON.parse(untrusted.stderr).error.details, false);
 });
 
-test("status reports an asynchronous processing deadline without source data", async (t) => {
+test("status reports Intake capacity and file Capture deadline reasons", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "brainpost-status-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const config = join(directory, "config.json");
   const intakeId = "50000000-0000-4000-8000-000000000008";
+  const captureId = "50000000-0000-4000-8000-000000000009";
   const server = createServer((request, response) => {
-    assert.equal(request.url, `/v1/intakes/${intakeId}`);
     response.setHeader("content-type", "application/json");
     response.end(
-      JSON.stringify({
-        id: intakeId,
-        status: "failed",
-        failureReason: "processing_deadline_exceeded",
-        refusalReason: null,
-        deliveryStatus: "not_applicable",
-        retryable: false,
-        sourceUrl: "https://private.example.test/source",
-        content: "private content",
-      }),
+      JSON.stringify(
+        request.url === `/v1/intakes/${intakeId}`
+          ? {
+              id: intakeId,
+              status: "capacity_limited",
+              failureReason: "global_queue_full",
+              refusalReason: null,
+              deliveryStatus: "not_applicable",
+              retryable: false,
+              sourceUrl: "https://private.example.test/source",
+              content: "private content",
+            }
+          : {
+              id: captureId,
+              status: "failed",
+              failureReason: "processing_deadline_exceeded",
+              sourceUrl: "https://private.example.test/file",
+            },
+      ),
     );
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -316,23 +325,38 @@ test("status reports an asynchronous processing deadline without source data", a
     { mode: 0o600 },
   );
 
-  const result = await run(["status", "--intake", intakeId], {
+  const intake = await run(["status", "--intake", intakeId], {
+    BRAINPOST_CONFIG: config,
+  });
+  const capture = await run(["status", "--capture", captureId], {
     BRAINPOST_CONFIG: config,
   });
 
-  assert.equal(result.code, 0, result.stderr);
-  assert.deepEqual(JSON.parse(result.stdout), {
+  assert.equal(intake.code, 0, intake.stderr);
+  assert.deepEqual(JSON.parse(intake.stdout), {
     ok: true,
     intake: {
       id: intakeId,
-      status: "failed",
-      failureReason: "processing_deadline_exceeded",
+      status: "capacity_limited",
+      failureReason: "global_queue_full",
       refusalReason: null,
       deliveryStatus: "not_applicable",
       retryable: false,
     },
   });
-  assert.doesNotMatch(result.stdout, /private\.example|private content/u);
+  assert.equal(capture.code, 0, capture.stderr);
+  assert.deepEqual(JSON.parse(capture.stdout), {
+    ok: true,
+    capture: {
+      id: captureId,
+      status: "failed",
+      failureReason: "processing_deadline_exceeded",
+    },
+  });
+  assert.doesNotMatch(
+    intake.stdout + capture.stdout,
+    /private\.example|private content/u,
+  );
 });
 
 test("BrainPost Skill submits a complete Markdown file without exposing its token", async (t) => {
