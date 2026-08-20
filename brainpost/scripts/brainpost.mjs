@@ -260,7 +260,7 @@ function configurationRequired() {
   );
 }
 
-function safeErrorDetails(code, value) {
+function safeErrorDetails(value) {
   if (!value || typeof value !== "object") return undefined;
   const details = {};
   if (
@@ -274,35 +274,6 @@ function safeErrorDetails(code, value) {
   }
   if (Number.isSafeInteger(value.maxFileBytes) && value.maxFileBytes >= 0) {
     details.maxFileBytes = value.maxFileBytes;
-  }
-  const handoffId = value.resume?.handoffId;
-  if (code === "upgrade_required" && uuid.test(handoffId ?? "")) {
-    details.resume = { handoffId };
-    if (Number.isSafeInteger(value.estimatedCredits)) {
-      details.estimatedCredits = value.estimatedCredits;
-    }
-    try {
-      const url = new URL(value.upgradeUrl);
-      const account = new URL(
-        process.env.BRAINPOST_WEB_URL ?? "https://brainpost.me",
-      );
-      const local = url.hostname === "localhost" || url.hostname === "127.0.0.1";
-      if (
-        !url.username &&
-        !url.password &&
-        (url.protocol === "https:" || (url.protocol === "http:" && local)) &&
-        url.origin === account.origin &&
-        url.pathname === "/" &&
-        url.searchParams.size === 2 &&
-        url.searchParams.get("upgrade") === "cloud" &&
-        url.searchParams.get("handoff") === handoffId &&
-        url.hash === "#account"
-      ) {
-        details.upgradeUrl = url.href;
-      }
-    } catch {
-      // Ignore untrusted recovery URLs.
-    }
   }
   return Object.keys(details).length ? details : undefined;
 }
@@ -352,7 +323,7 @@ async function request(config, path, init = {}) {
       ].includes(code)
         ? 4
         : 5,
-      safeErrorDetails(code, value?.error?.details),
+      safeErrorDetails(value?.error?.details),
     );
   }
   return value;

@@ -235,15 +235,13 @@ test("stable Platform rejections preserve reset data without private details", a
   }
 });
 
-test("legacy upgrade handoff keeps only its validated account URL", async (t) => {
+test("legacy upgrade handoff details are no longer exposed", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "brainpost-handoff-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const config = join(directory, "config.json");
   const handoffId = "90000000-0000-4000-8000-000000000001";
   const upgradeUrl = `https://brainpost.me/?upgrade=cloud&handoff=${handoffId}#account`;
-  let calls = 0;
   const server = createServer((_request, response) => {
-    calls += 1;
     response.writeHead(402, { "content-type": "application/json" });
     response.end(
       JSON.stringify({
@@ -252,10 +250,7 @@ test("legacy upgrade handoff keeps only its validated account URL", async (t) =>
           details: {
             estimatedCredits: 1,
             resume: { handoffId },
-            upgradeUrl:
-              calls === 1
-                ? upgradeUrl
-                : `https://private.example.test/?upgrade=cloud&handoff=${handoffId}#account`,
+            upgradeUrl,
             signedUrl: "https://private.example.test/source",
           },
         },
@@ -276,14 +271,10 @@ test("legacy upgrade handoff keeps only its validated account URL", async (t) =>
   });
 
   const details = JSON.parse(result.stderr).error.details;
-  assert.equal(details.upgradeUrl, upgradeUrl);
-  assert.equal(details.resume.handoffId, handoffId);
+  assert.equal("upgradeUrl" in details, false);
+  assert.equal("resume" in details, false);
+  assert.equal("estimatedCredits" in details, false);
   assert.equal("signedUrl" in details, false);
-  const untrusted = await run(
-    ["capture", "--url", "https://example.com/again"],
-    { BRAINPOST_CONFIG: config },
-  );
-  assert.equal("upgradeUrl" in JSON.parse(untrusted.stderr).error.details, false);
 });
 
 test("status reports Intake capacity and file Capture deadline reasons", async (t) => {
