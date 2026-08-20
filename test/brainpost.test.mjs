@@ -50,7 +50,14 @@ test("BrainPost Skill reports Platform membership capabilities", async (t) => {
     assert.equal(request.url, "/v1/account/capabilities");
     assert.equal(request.headers.authorization, `Bearer ${token}`);
     response.setHeader("content-type", "application/json");
-    response.end(JSON.stringify({ membership }));
+    response.end(
+      JSON.stringify({
+        membership: {
+          ...membership,
+          signedUrl: "https://private.example.test/capability",
+        },
+      }),
+    );
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => new Promise((resolve) => server.close(resolve)));
@@ -187,7 +194,7 @@ test("stable Platform rejections preserve reset data without private details", a
       JSON.stringify({
         error: {
           code: reasons[requestIndex++],
-          message: "Submission was rejected.",
+          message: "https://private.example.test/untrusted-message",
           details: {
             resetAt: "2026-08-20T16:00:00.000Z",
             timezone: "Asia/Shanghai",
@@ -221,7 +228,10 @@ test("stable Platform rejections preserve reset data without private details", a
     assert.equal(failure.error.details.timezone, "Asia/Shanghai");
     assert.equal("signedUrl" in failure.error.details, false);
     assert.equal(failure.error.details.idempotencyKey.length, 36);
-    assert.doesNotMatch(result.stderr, /private\.example|signed-source/u);
+    assert.doesNotMatch(
+      result.stderr,
+      /private\.example|signed-source|untrusted-message/u,
+    );
   }
 });
 
@@ -231,7 +241,9 @@ test("legacy upgrade handoff keeps only its validated account URL", async (t) =>
   const config = join(directory, "config.json");
   const handoffId = "90000000-0000-4000-8000-000000000001";
   const upgradeUrl = `https://brainpost.me/?upgrade=cloud&handoff=${handoffId}#account`;
+  let calls = 0;
   const server = createServer((_request, response) => {
+    calls += 1;
     response.writeHead(402, { "content-type": "application/json" });
     response.end(
       JSON.stringify({
@@ -240,7 +252,10 @@ test("legacy upgrade handoff keeps only its validated account URL", async (t) =>
           details: {
             estimatedCredits: 1,
             resume: { handoffId },
-            upgradeUrl,
+            upgradeUrl:
+              calls === 1
+                ? upgradeUrl
+                : `https://private.example.test/?upgrade=cloud&handoff=${handoffId}#account`,
             signedUrl: "https://private.example.test/source",
           },
         },
@@ -264,6 +279,60 @@ test("legacy upgrade handoff keeps only its validated account URL", async (t) =>
   assert.equal(details.upgradeUrl, upgradeUrl);
   assert.equal(details.resume.handoffId, handoffId);
   assert.equal("signedUrl" in details, false);
+  const untrusted = await run(
+    ["capture", "--url", "https://example.com/again"],
+    { BRAINPOST_CONFIG: config },
+  );
+  assert.equal("upgradeUrl" in JSON.parse(untrusted.stderr).error.details, false);
+});
+
+test("status reports an asynchronous processing deadline without source data", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "brainpost-status-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const config = join(directory, "config.json");
+  const intakeId = "50000000-0000-4000-8000-000000000008";
+  const server = createServer((request, response) => {
+    assert.equal(request.url, `/v1/intakes/${intakeId}`);
+    response.setHeader("content-type", "application/json");
+    response.end(
+      JSON.stringify({
+        id: intakeId,
+        status: "failed",
+        failureReason: "processing_deadline_exceeded",
+        refusalReason: null,
+        deliveryStatus: "not_applicable",
+        retryable: false,
+        sourceUrl: "https://private.example.test/source",
+        content: "private content",
+      }),
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  await writeFile(
+    config,
+    `${JSON.stringify({ apiUrl: `http://127.0.0.1:${address.port}`, token })}\n`,
+    { mode: 0o600 },
+  );
+
+  const result = await run(["status", "--intake", intakeId], {
+    BRAINPOST_CONFIG: config,
+  });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), {
+    ok: true,
+    intake: {
+      id: intakeId,
+      status: "failed",
+      failureReason: "processing_deadline_exceeded",
+      refusalReason: null,
+      deliveryStatus: "not_applicable",
+      retryable: false,
+    },
+  });
+  assert.doesNotMatch(result.stdout, /private\.example|private content/u);
 });
 
 test("BrainPost Skill submits a complete Markdown file without exposing its token", async (t) => {

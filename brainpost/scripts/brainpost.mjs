@@ -64,6 +64,24 @@ const captureStatuses = new Set([
   "refused",
   "failed",
 ]);
+const deliveryStatuses = new Set([
+  "processing",
+  "awaiting_vault",
+  "awaiting_sync",
+  "synced",
+  "not_applicable",
+]);
+const stableFailureReasons = new Set([
+  "daily_task_limit_reached",
+  "document_output_limit_exceeded",
+  "document_page_limit_exceeded",
+  "file_too_large",
+  "global_queue_full",
+  "membership_file_not_supported",
+  "processing_deadline_exceeded",
+  "processing_failed",
+  "recent_failure_limit_reached",
+]);
 
 class BrainPostError extends Error {
   constructor(code, message, exitCode = 1, details) {
@@ -78,6 +96,7 @@ function usage() {
   return `Usage:
   node brainpost.mjs configure [--api URL] < token.txt
   node brainpost.mjs capabilities
+  node brainpost.mjs status --intake UUID
   node brainpost.mjs capture (--url URL | --file PATH | --stdin) [--idempotency-key UUID]
 `;
 }
@@ -257,12 +276,20 @@ function safeErrorDetails(code, value) {
     }
     try {
       const url = new URL(value.upgradeUrl);
+      const account = new URL(
+        process.env.BRAINPOST_WEB_URL ?? "https://brainpost.me",
+      );
       const local = url.hostname === "localhost" || url.hostname === "127.0.0.1";
       if (
         !url.username &&
         !url.password &&
         (url.protocol === "https:" || (url.protocol === "http:" && local)) &&
-        url.searchParams.get("handoff") === handoffId
+        url.origin === account.origin &&
+        url.pathname === "/" &&
+        url.searchParams.size === 2 &&
+        url.searchParams.get("upgrade") === "cloud" &&
+        url.searchParams.get("handoff") === handoffId &&
+        url.hash === "#account"
       ) {
         details.upgradeUrl = url.href;
       }
@@ -271,6 +298,21 @@ function safeErrorDetails(code, value) {
     }
   }
   return Object.keys(details).length ? details : undefined;
+}
+
+function safeErrorMessage(code) {
+  return (
+    {
+      daily_task_limit_reached: "Today's BrainPost task allowance is used up.",
+      file_too_large: "The file exceeds the current BrainPost limit.",
+      global_queue_full: "BrainPost is currently at processing capacity.",
+      membership_file_not_supported:
+        "The current BrainPost membership does not support file conversion.",
+      processing_deadline_exceeded: "BrainPost processing exceeded its deadline.",
+      recent_failure_limit_reached:
+        "BrainPost temporarily paused new tasks after repeated failures.",
+    }[code] ?? "BrainPost rejected the request."
+  );
 }
 
 async function request(config, path, init = {}) {
@@ -295,7 +337,7 @@ async function request(config, path, init = {}) {
     const code = value?.error?.code ?? "api_error";
     throw new BrainPostError(
       code,
-      value?.error?.message ?? "BrainPost rejected the request.",
+      safeErrorMessage(code),
       [
         "invalid_file_artifact",
         "file_artifact_mismatch",
@@ -360,13 +402,67 @@ async function membershipCapabilities(config) {
       5,
     );
   }
-  return membership;
+  return {
+    tier: membership.tier,
+    policyVersion: membership.policyVersion,
+    dailyTaskLimit: membership.dailyTaskLimit,
+    completedToday: membership.completedToday,
+    reservedToday: membership.reservedToday,
+    remainingToday: membership.remainingToday,
+    fileIntakeEnabled: membership.fileIntakeEnabled,
+    maxFileBytes: membership.maxFileBytes,
+    timezone: membership.timezone,
+    resetAt: membership.resetAt,
+  };
 }
 
 async function showCapabilities(configPath) {
   const config = (await loadConfig(configPath)) ?? configurationRequired();
   process.stdout.write(
     `${JSON.stringify({ ok: true, membership: await membershipCapabilities(config) })}\n`,
+  );
+}
+
+function stableReason(value, fallback) {
+  return value === null
+    ? null
+    : typeof value === "string" && stableFailureReasons.has(value)
+      ? value
+      : fallback;
+}
+
+async function showStatus(args, configPath) {
+  const parsed = options(args, new Set(["--intake"]));
+  const intakeId = parsed.get("--intake") ?? "";
+  if (!uuid.test(intakeId)) {
+    throw new BrainPostError("usage_error", "Intake ID must be a UUID.", 2);
+  }
+  const config = (await loadConfig(configPath)) ?? configurationRequired();
+  const value = await request(config, `/v1/intakes/${intakeId}`);
+  if (
+    value?.id !== intakeId ||
+    !captureStatuses.has(value?.status) ||
+    !deliveryStatuses.has(value?.deliveryStatus) ||
+    typeof value?.retryable !== "boolean"
+  ) {
+    throw new BrainPostError(
+      "invalid_response",
+      "BrainPost returned an invalid Intake status.",
+      5,
+    );
+  }
+  process.stdout.write(
+    `${JSON.stringify({
+      ok: true,
+      intake: {
+        id: intakeId,
+        status: value.status,
+        failureReason: stableReason(value.failureReason, "processing_failed"),
+        refusalReason: stableReason(value.refusalReason, "refused"),
+        deliveryStatus: value.deliveryStatus,
+        retryable: value.retryable,
+      },
+    })}\n`,
   );
 }
 
@@ -641,6 +737,7 @@ async function main(args) {
   if (command === "configure") return configure(rest, configPath);
   if (command === "capabilities" && rest.length === 0)
     return showCapabilities(configPath);
+  if (command === "status") return showStatus(rest, configPath);
   if (command === "capture") return capture(rest, configPath);
   if (command === "help" || command === "--help" || command === undefined) {
     process.stdout.write(usage());
