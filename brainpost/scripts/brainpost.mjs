@@ -14,7 +14,6 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join } from "node:path";
 
 const maxContentBytes = 262_144;
-const maxFileBytes = 100 * 1024 * 1024;
 const documentExtensions = new Set([
   ".csv",
   ".doc",
@@ -78,6 +77,7 @@ class BrainPostError extends Error {
 function usage() {
   return `Usage:
   node brainpost.mjs configure [--api URL] < token.txt
+  node brainpost.mjs capabilities
   node brainpost.mjs capture (--url URL | --file PATH | --stdin) [--idempotency-key UUID]
 `;
 }
@@ -234,6 +234,31 @@ function configurationRequired() {
   );
 }
 
+function safeErrorDetails(code, value) {
+  if (!value || typeof value !== "object") return undefined;
+  const details = {};
+  if (
+    typeof value.resetAt === "string" &&
+    !Number.isNaN(Date.parse(value.resetAt))
+  ) {
+    details.resetAt = value.resetAt;
+  }
+  if (typeof value.timezone === "string" && value.timezone.length <= 64) {
+    details.timezone = value.timezone;
+  }
+  if (Number.isSafeInteger(value.maxFileBytes) && value.maxFileBytes >= 0) {
+    details.maxFileBytes = value.maxFileBytes;
+  }
+  const handoffId = value.resume?.handoffId;
+  if (code === "upgrade_required" && uuid.test(handoffId ?? "")) {
+    details.resume = { handoffId };
+    if (Number.isSafeInteger(value.estimatedCredits)) {
+      details.estimatedCredits = value.estimatedCredits;
+    }
+  }
+  return Object.keys(details).length ? details : undefined;
+}
+
 async function request(config, path, init = {}) {
   let response;
   try {
@@ -264,7 +289,7 @@ async function request(config, path, init = {}) {
       ].includes(code)
         ? 4
         : 5,
-      value?.error?.details,
+      safeErrorDetails(code, value?.error?.details),
     );
   }
   return value;
@@ -291,6 +316,44 @@ async function defaultVault(config) {
     projectName: vault.projectName,
     defaultVersion: vault.defaultVersion,
   };
+}
+
+async function membershipCapabilities(config) {
+  const value = await request(config, "/v1/account/capabilities");
+  const membership = value?.membership;
+  const counts = [
+    membership?.dailyTaskLimit,
+    membership?.completedToday,
+    membership?.reservedToday,
+    membership?.remainingToday,
+    membership?.maxFileBytes,
+  ];
+  if (
+    !["free", "premium", "pro"].includes(membership?.tier) ||
+    typeof membership?.policyVersion !== "string" ||
+    !membership.policyVersion ||
+    !counts.every(Number.isSafeInteger) ||
+    counts.some((count) => count < 0) ||
+    typeof membership.fileIntakeEnabled !== "boolean" ||
+    typeof membership.timezone !== "string" ||
+    !membership.timezone ||
+    typeof membership.resetAt !== "string" ||
+    Number.isNaN(Date.parse(membership.resetAt))
+  ) {
+    throw new BrainPostError(
+      "invalid_response",
+      "BrainPost returned invalid membership capabilities.",
+      5,
+    );
+  }
+  return membership;
+}
+
+async function showCapabilities(configPath) {
+  const config = (await loadConfig(configPath)) ?? configurationRequired();
+  process.stdout.write(
+    `${JSON.stringify({ ok: true, membership: await membershipCapabilities(config) })}\n`,
+  );
 }
 
 async function configure(args, configPath) {
@@ -331,18 +394,35 @@ async function submitDocumentFile(config, path, idempotencyKey) {
   } catch {
     throw new BrainPostError("input_error", "Document could not be read.", 4);
   }
-  if (!details.isFile() || details.size < 1 || details.size > maxFileBytes) {
+  if (!details.isFile() || details.size < 1) {
     throw new BrainPostError(
       "input_error",
-      "Document must be a regular file between 1 byte and 100 MB.",
+      "Document must be a non-empty regular file.",
       4,
     );
   }
-  const bytes = await readFile(path).catch(() => {
-    throw new BrainPostError("input_error", "Document could not be read.", 4);
-  });
   const mediaType = mediaTypes[extension] ?? "application/octet-stream";
   try {
+    const membership = await membershipCapabilities(config);
+    if (!membership.fileIntakeEnabled) {
+      throw new BrainPostError(
+        "membership_file_not_supported",
+        "The current BrainPost membership does not support file conversion.",
+        5,
+        { membership },
+      );
+    }
+    if (details.size > membership.maxFileBytes) {
+      throw new BrainPostError(
+        "file_too_large",
+        "Document exceeds the current BrainPost file limit.",
+        4,
+        { membership },
+      );
+    }
+    const bytes = await readFile(path).catch(() => {
+      throw new BrainPostError("input_error", "Document could not be read.", 4);
+    });
     const authorization = await request(config, "/v1/file-intakes", {
       method: "POST",
       headers: {
@@ -545,6 +625,8 @@ async function main(args) {
     join(homedir(), ".config", "brainpost", "config.json");
   const [command, ...rest] = args;
   if (command === "configure") return configure(rest, configPath);
+  if (command === "capabilities" && rest.length === 0)
+    return showCapabilities(configPath);
   if (command === "capture") return capture(rest, configPath);
   if (command === "help" || command === "--help" || command === undefined) {
     process.stdout.write(usage());

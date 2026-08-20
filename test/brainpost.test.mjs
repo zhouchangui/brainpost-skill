@@ -30,6 +30,201 @@ async function run(args, env, stdin = "") {
   return { code, stdout, stderr };
 }
 
+test("BrainPost Skill reports Platform membership capabilities", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "brainpost-capabilities-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const config = join(directory, "config.json");
+  const membership = {
+    tier: "premium",
+    policyVersion: "membership-v1",
+    dailyTaskLimit: 20,
+    completedToday: 7,
+    reservedToday: 2,
+    remainingToday: 11,
+    fileIntakeEnabled: true,
+    maxFileBytes: 52_428_800,
+    timezone: "Asia/Shanghai",
+    resetAt: "2026-08-20T16:00:00.000Z",
+  };
+  const server = createServer((request, response) => {
+    assert.equal(request.url, "/v1/account/capabilities");
+    assert.equal(request.headers.authorization, `Bearer ${token}`);
+    response.setHeader("content-type", "application/json");
+    response.end(JSON.stringify({ membership }));
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  await writeFile(
+    config,
+    `${JSON.stringify({ apiUrl: `http://127.0.0.1:${address.port}`, token })}\n`,
+    { mode: 0o600 },
+  );
+
+  const result = await run(["capabilities"], { BRAINPOST_CONFIG: config });
+
+  assert.equal(result.code, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.stdout), { ok: true, membership });
+  assert.doesNotMatch(result.stdout + result.stderr, new RegExp(token));
+});
+
+test("free membership rejects a document before reading or uploading it", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "brainpost-free-file-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const config = join(directory, "config.json");
+  const documentPath = join(directory, "private.docx");
+  await writeFile(documentPath, "not-read");
+  const calls = [];
+  const server = createServer(async (request, response) => {
+    calls.push(request.url);
+    if (request.url !== "/v1/account/capabilities") {
+      response.writeHead(500, { "content-type": "application/json" });
+      response.end(JSON.stringify({ error: { code: "unexpected_request" } }));
+      return;
+    }
+    await rm(documentPath);
+    response.setHeader("content-type", "application/json");
+    response.end(
+      JSON.stringify({
+        membership: {
+          tier: "free",
+          policyVersion: "membership-v1",
+          dailyTaskLimit: 5,
+          completedToday: 0,
+          reservedToday: 0,
+          remainingToday: 5,
+          fileIntakeEnabled: false,
+          maxFileBytes: 52_428_800,
+          timezone: "Asia/Shanghai",
+          resetAt: "2026-08-20T16:00:00.000Z",
+        },
+      }),
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  await writeFile(
+    config,
+    `${JSON.stringify({ apiUrl: `http://127.0.0.1:${address.port}`, token })}\n`,
+    { mode: 0o600 },
+  );
+
+  const result = await run(["capture", "--file", documentPath], {
+    BRAINPOST_CONFIG: config,
+  });
+
+  assert.equal(result.code, 5);
+  const failure = JSON.parse(result.stderr);
+  assert.equal(failure.error.code, "membership_file_not_supported");
+  assert.equal(failure.error.details.membership.tier, "free");
+  assert.equal(failure.error.details.idempotencyKey.length, 36);
+  assert.deepEqual(calls, ["/v1/account/capabilities"]);
+  assert.doesNotMatch(result.stdout + result.stderr, new RegExp(token));
+});
+
+test("document preflight uses the Platform file limit before reading", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "brainpost-file-limit-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const config = join(directory, "config.json");
+  const documentPath = join(directory, "large.pdf");
+  await writeFile(documentPath, "12345");
+  const server = createServer(async (request, response) => {
+    assert.equal(request.url, "/v1/account/capabilities");
+    await rm(documentPath);
+    response.setHeader("content-type", "application/json");
+    response.end(
+      JSON.stringify({
+        membership: {
+          tier: "premium",
+          policyVersion: "tight-policy",
+          dailyTaskLimit: 20,
+          completedToday: 0,
+          reservedToday: 0,
+          remainingToday: 20,
+          fileIntakeEnabled: true,
+          maxFileBytes: 4,
+          timezone: "Asia/Shanghai",
+          resetAt: "2026-08-20T16:00:00.000Z",
+        },
+      }),
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  await writeFile(
+    config,
+    `${JSON.stringify({ apiUrl: `http://127.0.0.1:${address.port}`, token })}\n`,
+    { mode: 0o600 },
+  );
+
+  const result = await run(["capture", "--file", documentPath], {
+    BRAINPOST_CONFIG: config,
+  });
+
+  assert.equal(result.code, 4);
+  const failure = JSON.parse(result.stderr);
+  assert.equal(failure.error.code, "file_too_large");
+  assert.equal(failure.error.details.membership.maxFileBytes, 4);
+});
+
+test("stable Platform rejections preserve reset data without private details", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "brainpost-rejections-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const config = join(directory, "config.json");
+  const reasons = [
+    "daily_task_limit_reached",
+    "recent_failure_limit_reached",
+    "global_queue_full",
+    "file_too_large",
+    "processing_deadline_exceeded",
+  ];
+  let requestIndex = 0;
+  const server = createServer((_request, response) => {
+    response.writeHead(429, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        error: {
+          code: reasons[requestIndex++],
+          message: "Submission was rejected.",
+          details: {
+            resetAt: "2026-08-20T16:00:00.000Z",
+            timezone: "Asia/Shanghai",
+            signedUrl: "https://private.example.test/signed-source",
+          },
+        },
+      }),
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  await writeFile(
+    config,
+    `${JSON.stringify({ apiUrl: `http://127.0.0.1:${address.port}`, token })}\n`,
+    { mode: 0o600 },
+  );
+
+  for (const reason of reasons) {
+    const result = await run(
+      ["capture", "--url", `https://example.com/${reason}`],
+      { BRAINPOST_CONFIG: config },
+    );
+    assert.equal(result.code, 5);
+    const failure = JSON.parse(result.stderr);
+    assert.equal(failure.error.code, reason);
+    assert.equal(
+      failure.error.details.resetAt,
+      "2026-08-20T16:00:00.000Z",
+    );
+    assert.equal(failure.error.details.timezone, "Asia/Shanghai");
+    assert.equal("signedUrl" in failure.error.details, false);
+    assert.equal(failure.error.details.idempotencyKey.length, 36);
+    assert.doesNotMatch(result.stderr, /private\.example|signed-source/u);
+  }
+});
+
 test("BrainPost Skill submits a complete Markdown file without exposing its token", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "brainpost-skill-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
@@ -87,7 +282,7 @@ test("BrainPost Skill submits a complete Markdown file without exposing its toke
   assert.doesNotMatch(result.stdout + result.stderr, new RegExp(token));
 });
 
-test("BrainPost Skill privately uploads a document and returns a bounded Capture receipt", async (t) => {
+test("Premium and Pro privately upload documents through the same File Intake", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "brainpost-document-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const config = join(directory, "config.json");
@@ -101,6 +296,7 @@ test("BrainPost Skill privately uploads a document and returns a bounded Capture
   const captureId = "50000000-0000-4000-8000-000000000009";
   const idempotencyKey = "80000000-0000-4000-8000-000000000001";
   const calls = [];
+  let capabilityCalls = 0;
   const server = createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
@@ -113,6 +309,26 @@ test("BrainPost Skill privately uploads a document and returns a bounded Capture
       path: new URL(request.url, "http://local.test").pathname,
     });
     response.setHeader("content-type", "application/json");
+    if (request.method === "GET" && request.url === "/v1/account/capabilities") {
+      capabilityCalls += 1;
+      response.end(
+        JSON.stringify({
+          membership: {
+            tier: capabilityCalls === 1 ? "premium" : "pro",
+            policyVersion: "membership-v1",
+            dailyTaskLimit: capabilityCalls === 1 ? 20 : 50,
+            completedToday: 0,
+            reservedToday: 0,
+            remainingToday: capabilityCalls === 1 ? 20 : 50,
+            fileIntakeEnabled: true,
+            maxFileBytes: 52_428_800,
+            timezone: "Asia/Shanghai",
+            resetAt: "2026-08-20T16:00:00.000Z",
+          },
+        }),
+      );
+      return;
+    }
     if (request.method === "POST" && request.url === "/v1/file-intakes") {
       response.writeHead(201);
       response.end(
@@ -139,22 +355,35 @@ test("BrainPost Skill privately uploads a document and returns a bounded Capture
     { mode: 0o600 },
   );
 
-  const result = await run(
+  const premium = await run(
     ["capture", "--file", documentPath, "--idempotency-key", idempotencyKey],
     { BRAINPOST_CONFIG: config },
   );
+  const proKey = "80000000-0000-4000-8000-000000000002";
+  const pro = await run(
+    ["capture", "--file", documentPath, "--idempotency-key", proKey],
+    { BRAINPOST_CONFIG: config },
+  );
 
-  assert.equal(result.code, 0, result.stderr);
-  assert.deepEqual(JSON.parse(result.stdout), {
+  assert.equal(premium.code, 0, premium.stderr);
+  assert.equal(pro.code, 0, pro.stderr);
+  assert.deepEqual(JSON.parse(premium.stdout), {
     ok: true,
     file: { captureId, filename: "report.docx", status: "accepted" },
   });
-  assert.equal(JSON.parse(calls[0].body).filename, "report.docx");
-  assert.deepEqual(calls[1].body, document);
-  assert.equal(calls[0].idempotencyKey, idempotencyKey);
-  assert.equal(calls[2].idempotencyKey, idempotencyKey);
+  assert.deepEqual(JSON.parse(pro.stdout), JSON.parse(premium.stdout));
+  assert.equal(JSON.parse(calls[1].body).filename, "report.docx");
+  assert.deepEqual(calls[2].body, document);
+  assert.equal(calls[1].idempotencyKey, idempotencyKey);
+  assert.equal(calls[3].idempotencyKey, idempotencyKey);
+  assert.equal(calls[5].idempotencyKey, proKey);
+  assert.equal(calls[7].idempotencyKey, proKey);
+  assert.equal(capabilityCalls, 2);
   assert.ok(calls.every((call) => call.authorization === `Bearer ${token}`));
-  assert.doesNotMatch(result.stdout + result.stderr, new RegExp(token));
+  assert.doesNotMatch(
+    premium.stdout + premium.stderr + pro.stdout + pro.stderr,
+    new RegExp(token),
+  );
 });
 
 test("BrainPost Skill configures the shared token and submits stdin or a URL", async (t) => {
