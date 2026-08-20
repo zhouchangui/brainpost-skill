@@ -255,6 +255,20 @@ function safeErrorDetails(code, value) {
     if (Number.isSafeInteger(value.estimatedCredits)) {
       details.estimatedCredits = value.estimatedCredits;
     }
+    try {
+      const url = new URL(value.upgradeUrl);
+      const local = url.hostname === "localhost" || url.hostname === "127.0.0.1";
+      if (
+        !url.username &&
+        !url.password &&
+        (url.protocol === "https:" || (url.protocol === "http:" && local)) &&
+        url.searchParams.get("handoff") === handoffId
+      ) {
+        details.upgradeUrl = url.href;
+      }
+    } catch {
+      // Ignore untrusted recovery URLs.
+    }
   }
   return Object.keys(details).length ? details : undefined;
 }

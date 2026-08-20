@@ -225,6 +225,47 @@ test("stable Platform rejections preserve reset data without private details", a
   }
 });
 
+test("legacy upgrade handoff keeps only its validated account URL", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "brainpost-handoff-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const config = join(directory, "config.json");
+  const handoffId = "90000000-0000-4000-8000-000000000001";
+  const upgradeUrl = `https://brainpost.me/?upgrade=cloud&handoff=${handoffId}#account`;
+  const server = createServer((_request, response) => {
+    response.writeHead(402, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        error: {
+          code: "upgrade_required",
+          details: {
+            estimatedCredits: 1,
+            resume: { handoffId },
+            upgradeUrl,
+            signedUrl: "https://private.example.test/source",
+          },
+        },
+      }),
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  await writeFile(
+    config,
+    `${JSON.stringify({ apiUrl: `http://127.0.0.1:${address.port}`, token })}\n`,
+    { mode: 0o600 },
+  );
+
+  const result = await run(["capture", "--url", "https://example.com"], {
+    BRAINPOST_CONFIG: config,
+  });
+
+  const details = JSON.parse(result.stderr).error.details;
+  assert.equal(details.upgradeUrl, upgradeUrl);
+  assert.equal(details.resume.handoffId, handoffId);
+  assert.equal("signedUrl" in details, false);
+});
+
 test("BrainPost Skill submits a complete Markdown file without exposing its token", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "brainpost-skill-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
