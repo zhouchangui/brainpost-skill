@@ -350,6 +350,7 @@ async function membershipCapabilities(config) {
   const value = await request(config, "/v1/account/capabilities");
   const membership = value?.membership;
   const purchase = membership?.purchase;
+  const plans = purchase?.plans;
   if (
     !["free", "premium", "pro"].includes(membership?.tier) ||
     typeof membership?.policyVersion !== "string" ||
@@ -366,7 +367,17 @@ async function membershipCapabilities(config) {
     (membership.termExpiresAt !== null &&
       (typeof membership.termExpiresAt !== "string" ||
         Number.isNaN(Date.parse(membership.termExpiresAt)))) ||
-    typeof purchase?.enabled !== "boolean"
+    typeof purchase?.enabled !== "boolean" ||
+    !Array.isArray(plans) ||
+    plans.length !== 2 ||
+    !plans.every(
+      (plan) =>
+        ["premium", "pro"].includes(plan?.tier) &&
+        Number.isSafeInteger(plan.amountCents) &&
+        plan.amountCents > 0 &&
+        (plan.action === null ||
+          ["open", "upgrade", "reopen", "renew"].includes(plan.action)),
+    )
   ) {
     throw new BrainPostError(
       "invalid_response",
@@ -374,17 +385,12 @@ async function membershipCapabilities(config) {
       5,
     );
   }
+  const recoveryPlan = purchase.enabled
+    ? plans.find((plan) => plan.action !== null)
+    : null;
   const recovery =
-    membership.allowanceState === "exhausted"
-      ? {
-          action:
-            membership.tier === "free"
-              ? "open"
-              : membership.tier === "premium"
-                ? "upgrade"
-                : "reopen",
-          url: membershipUrl,
-        }
+    membership.allowanceState === "exhausted" && recoveryPlan
+      ? { action: recoveryPlan.action, url: membershipUrl }
       : null;
   return {
     tier: membership.tier,
@@ -414,12 +420,13 @@ async function enrichAllowanceError(error, config) {
     membership,
     ...(membership.recovery ? { recovery: membership.recovery } : {}),
   };
-  error.message =
-    membership.tier === "free"
+  error.message = membership.recovery
+    ? membership.tier === "free"
       ? `BrainPost trial allowance is exhausted. Open Advanced or Pro: ${membershipUrl}`
       : membership.tier === "premium"
         ? `BrainPost Advanced allowance is exhausted. Upgrade to Pro: ${membershipUrl}`
-        : `BrainPost Pro allowance is exhausted. Reopen Pro: ${membershipUrl}`;
+        : `BrainPost Pro allowance is exhausted. Reopen Pro: ${membershipUrl}`
+    : "BrainPost allowance is exhausted. Membership purchase is currently unavailable.";
   return error;
 }
 

@@ -17,19 +17,20 @@ function membershipFixture(overrides = {}) {
   return {
     tier: "pro",
     policyVersion: "membership-v2",
-    allowanceKind: "membership_term",
-    allowanceLimit: 500,
-    completed: 7,
-    reserved: 2,
-    remaining: 491,
     allowanceState: "sufficient",
     usageMultiplier: 5,
-    welcomeRemaining: 20,
     termStartsAt: "2026-08-01T00:00:00.000Z",
     termExpiresAt: "2026-08-31T00:00:00.000Z",
     fileIntakeEnabled: true,
     maxFileBytes: 52_428_800,
-    purchase: { enabled: true, termDays: 30, plans: [] },
+    purchase: {
+      enabled: true,
+      termDays: 30,
+      plans: [
+        { tier: "premium", amountCents: 3900, action: null },
+        { tier: "pro", amountCents: 9900, action: null },
+      ],
+    },
     ...overrides,
   };
 }
@@ -57,8 +58,6 @@ test("BrainPost Skill reports Platform membership capabilities", async (t) => {
   const config = join(directory, "config.json");
   const platformMembership = membershipFixture({
     tier: "premium",
-    allowanceLimit: 100,
-    remaining: 91,
     usageMultiplier: 1,
     fileIntakeEnabled: false,
   });
@@ -123,11 +122,6 @@ test("free membership rejects a document before reading or uploading it", async 
       JSON.stringify({
         membership: membershipFixture({
           tier: "free",
-          allowanceKind: "welcome",
-          allowanceLimit: 20,
-          completed: 0,
-          reserved: 0,
-          remaining: 20,
           usageMultiplier: null,
           termStartsAt: null,
           termExpiresAt: null,
@@ -222,6 +216,27 @@ test("allowance rejections use tier-aware recovery without daily reset details",
             usageMultiplier:
               current.tier === "free" ? null : current.tier === "premium" ? 1 : 5,
             fileIntakeEnabled: current.tier === "pro",
+            purchase: {
+              enabled: true,
+              termDays: 30,
+              plans: [
+                {
+                  tier: "premium",
+                  amountCents: 3900,
+                  action: current.tier === "free" ? "open" : null,
+                },
+                {
+                  tier: "pro",
+                  amountCents: 9900,
+                  action:
+                    current.tier === "free"
+                      ? "open"
+                      : current.tier === "premium"
+                        ? "upgrade"
+                        : "reopen",
+                },
+              ],
+            },
           }),
         }),
       );
@@ -278,6 +293,56 @@ test("allowance rejections use tier-aware recovery without daily reset details",
       /private\.example|signed-source|untrusted-message|Today|reset/u,
     );
   }
+});
+
+test("allowance rejection omits recovery when membership purchase is unavailable", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "brainpost-no-purchase-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const config = join(directory, "config.json");
+  const server = createServer((request, response) => {
+    response.setHeader("content-type", "application/json");
+    if (request.url === "/v1/account/capabilities") {
+      response.end(
+        JSON.stringify({
+          membership: membershipFixture({
+            allowanceState: "exhausted",
+            purchase: {
+              enabled: false,
+              termDays: 30,
+              plans: [
+                { tier: "premium", amountCents: 3900, action: null },
+                { tier: "pro", amountCents: 9900, action: null },
+              ],
+            },
+          }),
+        }),
+      );
+      return;
+    }
+    response.writeHead(429);
+    response.end(
+      JSON.stringify({
+        error: { code: "task_allowance_exhausted", message: "exhausted" },
+      }),
+    );
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => new Promise((resolve) => server.close(resolve)));
+  const address = server.address();
+  await writeFile(
+    config,
+    `${JSON.stringify({ apiUrl: `http://127.0.0.1:${address.port}`, token })}\n`,
+    { mode: 0o600 },
+  );
+
+  const result = await run(
+    ["capture", "--url", "https://example.com/no-purchase"],
+    { BRAINPOST_CONFIG: config },
+  );
+  assert.equal(result.code, 5);
+  const failure = JSON.parse(result.stderr);
+  assert.equal(failure.error.details.recovery, undefined);
+  assert.doesNotMatch(failure.error.message, /brainpost\.me|Open|Upgrade|Reopen/u);
 });
 
 test("legacy upgrade handoff details are no longer exposed", async (t) => {
@@ -485,8 +550,6 @@ test("Premium rejects documents before reading while Pro uses File Intake", asyn
         JSON.stringify({
           membership: membershipFixture({
             tier: capabilityCalls === 1 ? "premium" : "pro",
-            allowanceLimit: capabilityCalls === 1 ? 100 : 500,
-            remaining: capabilityCalls === 1 ? 100 : 500,
             usageMultiplier: capabilityCalls === 1 ? 1 : 5,
             fileIntakeEnabled: capabilityCalls !== 1,
           }),
