@@ -13,6 +13,27 @@ const script = fileURLToPath(
 const token = `ikt1_${"A".repeat(43)}`;
 const projectId = "20000000-0000-4000-8000-000000000001";
 
+function membershipFixture(overrides = {}) {
+  return {
+    tier: "pro",
+    policyVersion: "membership-v2",
+    allowanceKind: "membership_term",
+    allowanceLimit: 500,
+    completed: 7,
+    reserved: 2,
+    remaining: 491,
+    allowanceState: "sufficient",
+    usageMultiplier: 5,
+    welcomeRemaining: 20,
+    termStartsAt: "2026-08-01T00:00:00.000Z",
+    termExpiresAt: "2026-08-31T00:00:00.000Z",
+    fileIntakeEnabled: true,
+    maxFileBytes: 52_428_800,
+    purchase: { enabled: true, termDays: 30, plans: [] },
+    ...overrides,
+  };
+}
+
 async function run(args, env, stdin = "") {
   const child = spawn(process.execPath, [script, ...args], {
     env: { ...process.env, ...env },
@@ -34,18 +55,13 @@ test("BrainPost Skill reports Platform membership capabilities", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "brainpost-capabilities-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const config = join(directory, "config.json");
-  const membership = {
+  const platformMembership = membershipFixture({
     tier: "premium",
-    policyVersion: "membership-v1",
-    dailyTaskLimit: 20,
-    completedToday: 7,
-    reservedToday: 2,
-    remainingToday: 11,
-    fileIntakeEnabled: true,
-    maxFileBytes: 52_428_800,
-    timezone: "Asia/Shanghai",
-    resetAt: "2026-08-20T16:00:00.000Z",
-  };
+    allowanceLimit: 100,
+    remaining: 91,
+    usageMultiplier: 1,
+    fileIntakeEnabled: false,
+  });
   const server = createServer((request, response) => {
     assert.equal(request.url, "/v1/account/capabilities");
     assert.equal(request.headers.authorization, `Bearer ${token}`);
@@ -53,7 +69,7 @@ test("BrainPost Skill reports Platform membership capabilities", async (t) => {
     response.end(
       JSON.stringify({
         membership: {
-          ...membership,
+          ...platformMembership,
           signedUrl: "https://private.example.test/capability",
         },
       }),
@@ -71,7 +87,19 @@ test("BrainPost Skill reports Platform membership capabilities", async (t) => {
   const result = await run(["capabilities"], { BRAINPOST_CONFIG: config });
 
   assert.equal(result.code, 0, result.stderr);
-  assert.deepEqual(JSON.parse(result.stdout), { ok: true, membership });
+  assert.deepEqual(JSON.parse(result.stdout), {
+    ok: true,
+    membership: {
+      tier: "premium",
+      allowanceState: "sufficient",
+      usageMultiplier: 1,
+      fileIntakeEnabled: false,
+      maxFileBytes: 52_428_800,
+      termExpiresAt: "2026-08-31T00:00:00.000Z",
+      purchaseEnabled: true,
+    },
+  });
+  assert.doesNotMatch(result.stdout, /allowanceLimit|completed|remaining|policyVersion/);
   assert.doesNotMatch(result.stdout + result.stderr, new RegExp(token));
 });
 
@@ -93,18 +121,18 @@ test("free membership rejects a document before reading or uploading it", async 
     response.setHeader("content-type", "application/json");
     response.end(
       JSON.stringify({
-        membership: {
+        membership: membershipFixture({
           tier: "free",
-          policyVersion: "membership-v1",
-          dailyTaskLimit: 5,
-          completedToday: 0,
-          reservedToday: 0,
-          remainingToday: 5,
+          allowanceKind: "welcome",
+          allowanceLimit: 20,
+          completed: 0,
+          reserved: 0,
+          remaining: 20,
+          usageMultiplier: null,
+          termStartsAt: null,
+          termExpiresAt: null,
           fileIntakeEnabled: false,
-          maxFileBytes: 52_428_800,
-          timezone: "Asia/Shanghai",
-          resetAt: "2026-08-20T16:00:00.000Z",
-        },
+        }),
       }),
     );
   });
@@ -125,6 +153,8 @@ test("free membership rejects a document before reading or uploading it", async 
   const failure = JSON.parse(result.stderr);
   assert.equal(failure.error.code, "membership_file_not_supported");
   assert.equal(failure.error.details.membership.tier, "free");
+  assert.equal(failure.error.details.membership.fileIntakeEnabled, false);
+  assert.equal("allowanceLimit" in failure.error.details.membership, false);
   assert.equal(failure.error.details.idempotencyKey.length, 36);
   assert.deepEqual(calls, ["/v1/account/capabilities"]);
   assert.doesNotMatch(result.stdout + result.stderr, new RegExp(token));
@@ -142,18 +172,7 @@ test("document preflight uses the Platform file limit before reading", async (t)
     response.setHeader("content-type", "application/json");
     response.end(
       JSON.stringify({
-        membership: {
-          tier: "premium",
-          policyVersion: "tight-policy",
-          dailyTaskLimit: 20,
-          completedToday: 0,
-          reservedToday: 0,
-          remainingToday: 20,
-          fileIntakeEnabled: true,
-          maxFileBytes: 4,
-          timezone: "Asia/Shanghai",
-          resetAt: "2026-08-20T16:00:00.000Z",
-        },
+        membership: membershipFixture({ maxFileBytes: 4 }),
       }),
     );
   });
@@ -176,24 +195,44 @@ test("document preflight uses the Platform file limit before reading", async (t)
   assert.equal(failure.error.details.membership.maxFileBytes, 4);
 });
 
-test("stable Platform rejections preserve reset data without private details", async (t) => {
+test("allowance rejections use tier-aware recovery without daily reset details", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "brainpost-rejections-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const config = join(directory, "config.json");
-  const reasons = [
-    "daily_task_limit_reached",
-    "recent_failure_limit_reached",
-    "global_queue_full",
-    "file_too_large",
-    "processing_deadline_exceeded",
+  const cases = [
+    { code: "task_allowance_exhausted", tier: "free", action: "open" },
+    { code: "task_allowance_exhausted", tier: "premium", action: "upgrade" },
+    { code: "task_allowance_exhausted", tier: "pro", action: "reopen" },
+    { code: "daily_task_limit_reached", tier: "free", action: "open" },
+    { code: "recent_failure_limit_reached" },
+    { code: "global_queue_full" },
+    { code: "file_too_large" },
+    { code: "processing_deadline_exceeded" },
   ];
   let requestIndex = 0;
-  const server = createServer((_request, response) => {
+  const server = createServer((request, response) => {
+    if (request.url === "/v1/account/capabilities") {
+      const current = cases[requestIndex - 1];
+      response.setHeader("content-type", "application/json");
+      response.end(
+        JSON.stringify({
+          membership: membershipFixture({
+            tier: current.tier,
+            allowanceState: "exhausted",
+            usageMultiplier:
+              current.tier === "free" ? null : current.tier === "premium" ? 1 : 5,
+            fileIntakeEnabled: current.tier === "pro",
+          }),
+        }),
+      );
+      return;
+    }
+    const current = cases[requestIndex++];
     response.writeHead(429, { "content-type": "application/json" });
     response.end(
       JSON.stringify({
         error: {
-          code: reasons[requestIndex++],
+          code: current.code,
           message: "https://private.example.test/untrusted-message",
           details: {
             resetAt: "2026-08-20T16:00:00.000Z",
@@ -213,24 +252,30 @@ test("stable Platform rejections preserve reset data without private details", a
     { mode: 0o600 },
   );
 
-  for (const reason of reasons) {
+  for (const item of cases) {
     const result = await run(
-      ["capture", "--url", `https://example.com/${reason}`],
+      ["capture", "--url", `https://example.com/${item.code}`],
       { BRAINPOST_CONFIG: config },
     );
     assert.equal(result.code, 5);
     const failure = JSON.parse(result.stderr);
-    assert.equal(failure.error.code, reason);
-    assert.equal(
-      failure.error.details.resetAt,
-      "2026-08-20T16:00:00.000Z",
-    );
-    assert.equal(failure.error.details.timezone, "Asia/Shanghai");
+    assert.equal(failure.error.code, item.code);
+    assert.equal("resetAt" in failure.error.details, false);
+    assert.equal("timezone" in failure.error.details, false);
     assert.equal("signedUrl" in failure.error.details, false);
     assert.equal(failure.error.details.idempotencyKey.length, 36);
+    if (item.action) {
+      assert.equal(failure.error.details.membership.tier, item.tier);
+      assert.equal(failure.error.details.recovery.action, item.action);
+      assert.equal(
+        failure.error.details.recovery.url,
+        "https://brainpost.me/account.html#membership",
+      );
+      assert.match(failure.error.message, /brainpost\.me\/account\.html#membership/u);
+    }
     assert.doesNotMatch(
       result.stderr,
-      /private\.example|signed-source|untrusted-message/u,
+      /private\.example|signed-source|untrusted-message|Today|reset/u,
     );
   }
 });
@@ -407,7 +452,7 @@ test("BrainPost Skill submits a complete Markdown file without exposing its toke
   assert.doesNotMatch(result.stdout + result.stderr, new RegExp(token));
 });
 
-test("Premium and Pro privately upload documents through the same File Intake", async (t) => {
+test("Premium rejects documents before reading while Pro uses File Intake", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "brainpost-document-"));
   t.after(() => rm(directory, { recursive: true, force: true }));
   const config = join(directory, "config.json");
@@ -438,18 +483,13 @@ test("Premium and Pro privately upload documents through the same File Intake", 
       capabilityCalls += 1;
       response.end(
         JSON.stringify({
-          membership: {
+          membership: membershipFixture({
             tier: capabilityCalls === 1 ? "premium" : "pro",
-            policyVersion: "membership-v1",
-            dailyTaskLimit: capabilityCalls === 1 ? 20 : 50,
-            completedToday: 0,
-            reservedToday: 0,
-            remainingToday: capabilityCalls === 1 ? 20 : 50,
-            fileIntakeEnabled: true,
-            maxFileBytes: 52_428_800,
-            timezone: "Asia/Shanghai",
-            resetAt: "2026-08-20T16:00:00.000Z",
-          },
+            allowanceLimit: capabilityCalls === 1 ? 100 : 500,
+            remaining: capabilityCalls === 1 ? 100 : 500,
+            usageMultiplier: capabilityCalls === 1 ? 1 : 5,
+            fileIntakeEnabled: capabilityCalls !== 1,
+          }),
         }),
       );
       return;
@@ -490,19 +530,20 @@ test("Premium and Pro privately upload documents through the same File Intake", 
     { BRAINPOST_CONFIG: config },
   );
 
-  assert.equal(premium.code, 0, premium.stderr);
+  assert.equal(premium.code, 5);
   assert.equal(pro.code, 0, pro.stderr);
-  assert.deepEqual(JSON.parse(premium.stdout), {
+  assert.equal(
+    JSON.parse(premium.stderr).error.code,
+    "membership_file_not_supported",
+  );
+  assert.deepEqual(JSON.parse(pro.stdout), {
     ok: true,
     file: { captureId, filename: "report.docx", status: "accepted" },
   });
-  assert.deepEqual(JSON.parse(pro.stdout), JSON.parse(premium.stdout));
-  assert.equal(JSON.parse(calls[1].body).filename, "report.docx");
-  assert.deepEqual(calls[2].body, document);
-  assert.equal(calls[1].idempotencyKey, idempotencyKey);
-  assert.equal(calls[3].idempotencyKey, idempotencyKey);
-  assert.equal(calls[5].idempotencyKey, proKey);
-  assert.equal(calls[7].idempotencyKey, proKey);
+  assert.equal(JSON.parse(calls[2].body).filename, "report.docx");
+  assert.deepEqual(calls[3].body, document);
+  assert.equal(calls[2].idempotencyKey, proKey);
+  assert.equal(calls[4].idempotencyKey, proKey);
   assert.equal(capabilityCalls, 2);
   assert.ok(calls.every((call) => call.authorization === `Bearer ${token}`));
   assert.doesNotMatch(

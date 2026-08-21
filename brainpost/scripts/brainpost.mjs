@@ -14,6 +14,7 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join } from "node:path";
 
 const maxContentBytes = 262_144;
+const membershipUrl = "https://brainpost.me/account.html#membership";
 const documentExtensions = new Set([
   ".csv",
   ".doc",
@@ -78,6 +79,7 @@ const deliveryStatuses = new Set([
 ]);
 const stableFailureReasons = new Set([
   "daily_task_limit_reached",
+  "task_allowance_exhausted",
   "document_output_limit_exceeded",
   "document_page_limit_exceeded",
   "file_too_large",
@@ -263,15 +265,6 @@ function configurationRequired() {
 function safeErrorDetails(value) {
   if (!value || typeof value !== "object") return undefined;
   const details = {};
-  if (
-    typeof value.resetAt === "string" &&
-    !Number.isNaN(Date.parse(value.resetAt))
-  ) {
-    details.resetAt = value.resetAt;
-  }
-  if (typeof value.timezone === "string" && value.timezone.length <= 64) {
-    details.timezone = value.timezone;
-  }
   if (Number.isSafeInteger(value.maxFileBytes) && value.maxFileBytes >= 0) {
     details.maxFileBytes = value.maxFileBytes;
   }
@@ -281,11 +274,12 @@ function safeErrorDetails(value) {
 function safeErrorMessage(code) {
   return (
     {
-      daily_task_limit_reached: "Today's BrainPost task allowance is used up.",
+      daily_task_limit_reached: `BrainPost allowance is exhausted. Open membership: ${membershipUrl}`,
+      task_allowance_exhausted: `BrainPost allowance is exhausted. Open membership: ${membershipUrl}`,
       file_too_large: "The file exceeds the current BrainPost limit.",
       global_queue_full: "BrainPost is currently at processing capacity.",
       membership_file_not_supported:
-        "The current BrainPost membership does not support file conversion.",
+        `File organization is a Pro benefit. Open membership: ${membershipUrl}`,
       processing_deadline_exceeded: "BrainPost processing exceeded its deadline.",
       recent_failure_limit_reached:
         "BrainPost temporarily paused new tasks after repeated failures.",
@@ -355,24 +349,24 @@ async function defaultVault(config) {
 async function membershipCapabilities(config) {
   const value = await request(config, "/v1/account/capabilities");
   const membership = value?.membership;
-  const counts = [
-    membership?.dailyTaskLimit,
-    membership?.completedToday,
-    membership?.reservedToday,
-    membership?.remainingToday,
-    membership?.maxFileBytes,
-  ];
+  const purchase = membership?.purchase;
   if (
     !["free", "premium", "pro"].includes(membership?.tier) ||
     typeof membership?.policyVersion !== "string" ||
     !membership.policyVersion ||
-    !counts.every(Number.isSafeInteger) ||
-    counts.some((count) => count < 0) ||
+    !["sufficient", "running_low", "exhausted"].includes(
+      membership?.allowanceState,
+    ) ||
+    (membership.usageMultiplier !== null &&
+      (!Number.isSafeInteger(membership.usageMultiplier) ||
+        membership.usageMultiplier < 1)) ||
     typeof membership.fileIntakeEnabled !== "boolean" ||
-    typeof membership.timezone !== "string" ||
-    !membership.timezone ||
-    typeof membership.resetAt !== "string" ||
-    Number.isNaN(Date.parse(membership.resetAt))
+    !Number.isSafeInteger(membership.maxFileBytes) ||
+    membership.maxFileBytes < 1 ||
+    (membership.termExpiresAt !== null &&
+      (typeof membership.termExpiresAt !== "string" ||
+        Number.isNaN(Date.parse(membership.termExpiresAt)))) ||
+    typeof purchase?.enabled !== "boolean"
   ) {
     throw new BrainPostError(
       "invalid_response",
@@ -380,18 +374,53 @@ async function membershipCapabilities(config) {
       5,
     );
   }
+  const recovery =
+    membership.allowanceState === "exhausted"
+      ? {
+          action:
+            membership.tier === "free"
+              ? "open"
+              : membership.tier === "premium"
+                ? "upgrade"
+                : "reopen",
+          url: membershipUrl,
+        }
+      : null;
   return {
     tier: membership.tier,
-    policyVersion: membership.policyVersion,
-    dailyTaskLimit: membership.dailyTaskLimit,
-    completedToday: membership.completedToday,
-    reservedToday: membership.reservedToday,
-    remainingToday: membership.remainingToday,
+    allowanceState: membership.allowanceState,
+    usageMultiplier: membership.usageMultiplier,
     fileIntakeEnabled: membership.fileIntakeEnabled,
     maxFileBytes: membership.maxFileBytes,
-    timezone: membership.timezone,
-    resetAt: membership.resetAt,
+    termExpiresAt: membership.termExpiresAt,
+    purchaseEnabled: purchase.enabled,
+    ...(recovery ? { recovery } : {}),
   };
+}
+
+async function enrichAllowanceError(error, config) {
+  if (
+    !(error instanceof BrainPostError) ||
+    !["daily_task_limit_reached", "task_allowance_exhausted"].includes(
+      error.code,
+    )
+  ) {
+    return error;
+  }
+  const membership = await membershipCapabilities(config).catch(() => null);
+  if (!membership) return error;
+  error.details = {
+    ...error.details,
+    membership,
+    ...(membership.recovery ? { recovery: membership.recovery } : {}),
+  };
+  error.message =
+    membership.tier === "free"
+      ? `BrainPost trial allowance is exhausted. Open Advanced or Pro: ${membershipUrl}`
+      : membership.tier === "premium"
+        ? `BrainPost Advanced allowance is exhausted. Upgrade to Pro: ${membershipUrl}`
+        : `BrainPost Pro allowance is exhausted. Reopen Pro: ${membershipUrl}`;
+  return error;
 }
 
 async function showCapabilities(configPath) {
@@ -524,7 +553,7 @@ async function submitDocumentFile(config, path, idempotencyKey) {
     if (!membership.fileIntakeEnabled) {
       throw new BrainPostError(
         "membership_file_not_supported",
-        "The current BrainPost membership does not support file conversion.",
+        `File organization is a Pro benefit. Open membership: ${membershipUrl}`,
         5,
         { membership },
       );
@@ -594,6 +623,7 @@ async function submitDocumentFile(config, path, idempotencyKey) {
       `${JSON.stringify({ ok: true, file: { captureId: capture.id, filename, status: capture.status } })}\n`,
     );
   } catch (error) {
+    error = await enrichAllowanceError(error, config);
     if (error instanceof BrainPostError) {
       error.details = { ...error.details, idempotencyKey };
     }
@@ -715,6 +745,7 @@ async function capture(args, configPath) {
       body: JSON.stringify(body),
     });
   } catch (error) {
+    error = await enrichAllowanceError(error, config);
     if (error instanceof BrainPostError) {
       error.details = { ...error.details, idempotencyKey };
     }
