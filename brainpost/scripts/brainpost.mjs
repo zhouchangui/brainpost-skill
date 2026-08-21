@@ -278,9 +278,9 @@ function safeErrorMessage(code) {
       task_allowance_exhausted: `BrainPost allowance is exhausted. Open membership: ${membershipUrl}`,
       file_too_large: "The file exceeds the current BrainPost limit.",
       global_queue_full: "BrainPost is currently at processing capacity.",
-      membership_file_not_supported:
-        `File organization is a Pro benefit. Open membership: ${membershipUrl}`,
-      processing_deadline_exceeded: "BrainPost processing exceeded its deadline.",
+      membership_file_not_supported: `File organization is a Pro benefit. Open membership: ${membershipUrl}`,
+      processing_deadline_exceeded:
+        "BrainPost processing exceeded its deadline.",
       recent_failure_limit_reached:
         "BrainPost temporarily paused new tasks after repeated failures.",
     }[code] ?? "BrainPost rejected the request."
@@ -361,6 +361,7 @@ async function membershipCapabilities(config) {
     (membership.usageMultiplier !== null &&
       (!Number.isSafeInteger(membership.usageMultiplier) ||
         membership.usageMultiplier < 1)) ||
+    typeof membership.legacyTerm !== "boolean" ||
     typeof membership.fileIntakeEnabled !== "boolean" ||
     !Number.isSafeInteger(membership.maxFileBytes) ||
     membership.maxFileBytes < 1 ||
@@ -376,7 +377,9 @@ async function membershipCapabilities(config) {
         Number.isSafeInteger(plan.amountCents) &&
         plan.amountCents > 0 &&
         (plan.action === null ||
-          ["open", "upgrade", "reopen", "renew"].includes(plan.action)),
+          ["open", "upgrade", "reopen", "renew", "resume"].includes(
+            plan.action,
+          )),
     )
   ) {
     throw new BrainPostError(
@@ -396,6 +399,7 @@ async function membershipCapabilities(config) {
     tier: membership.tier,
     allowanceState: membership.allowanceState,
     usageMultiplier: membership.usageMultiplier,
+    legacyTerm: membership.legacyTerm,
     fileIntakeEnabled: membership.fileIntakeEnabled,
     maxFileBytes: membership.maxFileBytes,
     termExpiresAt: membership.termExpiresAt,
@@ -473,10 +477,7 @@ async function showStatus(args, configPath) {
         capture: {
           id,
           status: value.status,
-          failureReason: stableReason(
-            value.failureReason,
-            "processing_failed",
-          ),
+          failureReason: stableReason(value.failureReason, "processing_failed"),
         },
       })}\n`,
     );

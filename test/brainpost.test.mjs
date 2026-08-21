@@ -19,6 +19,7 @@ function membershipFixture(overrides = {}) {
     policyVersion: "membership-v2",
     allowanceState: "sufficient",
     usageMultiplier: 5,
+    legacyTerm: false,
     termStartsAt: "2026-08-01T00:00:00.000Z",
     termExpiresAt: "2026-08-31T00:00:00.000Z",
     fileIntakeEnabled: true,
@@ -92,13 +93,17 @@ test("BrainPost Skill reports Platform membership capabilities", async (t) => {
       tier: "premium",
       allowanceState: "sufficient",
       usageMultiplier: 1,
+      legacyTerm: false,
       fileIntakeEnabled: false,
       maxFileBytes: 52_428_800,
       termExpiresAt: "2026-08-31T00:00:00.000Z",
       purchaseEnabled: true,
     },
   });
-  assert.doesNotMatch(result.stdout, /allowanceLimit|completed|remaining|policyVersion/);
+  assert.doesNotMatch(
+    result.stdout,
+    /allowanceLimit|completed|remaining|policyVersion/,
+  );
   assert.doesNotMatch(result.stdout + result.stderr, new RegExp(token));
 });
 
@@ -196,7 +201,7 @@ test("allowance rejections use tier-aware recovery without daily reset details",
   const cases = [
     { code: "task_allowance_exhausted", tier: "free", action: "open" },
     { code: "task_allowance_exhausted", tier: "premium", action: "upgrade" },
-    { code: "task_allowance_exhausted", tier: "pro", action: "reopen" },
+    { code: "task_allowance_exhausted", tier: "pro", action: "resume" },
     { code: "daily_task_limit_reached", tier: "free", action: "open" },
     { code: "recent_failure_limit_reached" },
     { code: "global_queue_full" },
@@ -214,7 +219,11 @@ test("allowance rejections use tier-aware recovery without daily reset details",
             tier: current.tier,
             allowanceState: "exhausted",
             usageMultiplier:
-              current.tier === "free" ? null : current.tier === "premium" ? 1 : 5,
+              current.tier === "free"
+                ? null
+                : current.tier === "premium"
+                  ? 1
+                  : 5,
             fileIntakeEnabled: current.tier === "pro",
             purchase: {
               enabled: true,
@@ -233,7 +242,7 @@ test("allowance rejections use tier-aware recovery without daily reset details",
                       ? "open"
                       : current.tier === "premium"
                         ? "upgrade"
-                        : "reopen",
+                        : "resume",
                 },
               ],
             },
@@ -286,7 +295,10 @@ test("allowance rejections use tier-aware recovery without daily reset details",
         failure.error.details.recovery.url,
         "https://brainpost.me/account.html#membership",
       );
-      assert.match(failure.error.message, /brainpost\.me\/account\.html#membership/u);
+      assert.match(
+        failure.error.message,
+        /brainpost\.me\/account\.html#membership/u,
+      );
     }
     assert.doesNotMatch(
       result.stderr,
@@ -342,7 +354,10 @@ test("allowance rejection omits recovery when membership purchase is unavailable
   assert.equal(result.code, 5);
   const failure = JSON.parse(result.stderr);
   assert.equal(failure.error.details.recovery, undefined);
-  assert.doesNotMatch(failure.error.message, /brainpost\.me|Open|Upgrade|Reopen/u);
+  assert.doesNotMatch(
+    failure.error.message,
+    /brainpost\.me|Open|Upgrade|Reopen/u,
+  );
 });
 
 test("legacy upgrade handoff details are no longer exposed", async (t) => {
@@ -544,7 +559,10 @@ test("Premium rejects documents before reading while Pro uses File Intake", asyn
       path: new URL(request.url, "http://local.test").pathname,
     });
     response.setHeader("content-type", "application/json");
-    if (request.method === "GET" && request.url === "/v1/account/capabilities") {
+    if (
+      request.method === "GET" &&
+      request.url === "/v1/account/capabilities"
+    ) {
       capabilityCalls += 1;
       response.end(
         JSON.stringify({
