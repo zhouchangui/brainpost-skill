@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   mkdir,
   readFile,
@@ -11,9 +11,46 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, extname, isAbsolute, join } from "node:path";
 
 const maxContentBytes = 262_144;
+const membershipUrl = "https://brainpost.me/account.html#membership";
+const documentExtensions = new Set([
+  ".csv",
+  ".doc",
+  ".docm",
+  ".docx",
+  ".epub",
+  ".odp",
+  ".ods",
+  ".odt",
+  ".pdf",
+  ".pot",
+  ".pps",
+  ".ppsm",
+  ".ppsx",
+  ".ppt",
+  ".pptm",
+  ".pptx",
+  ".rtf",
+  ".xls",
+  ".xlsb",
+  ".xlsm",
+  ".xlsx",
+]);
+const mediaTypes = {
+  ".csv": "text/csv",
+  ".doc": "application/msword",
+  ".docx":
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".pdf": "application/pdf",
+  ".ppt": "application/vnd.ms-powerpoint",
+  ".pptx":
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  ".rtf": "application/rtf",
+  ".xls": "application/vnd.ms-excel",
+  ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+};
 const uuid =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const tokenPattern = /^ikt1_[A-Za-z0-9_-]{43}$/;
@@ -28,6 +65,32 @@ const captureStatuses = new Set([
   "refused",
   "failed",
 ]);
+const intakeStatuses = new Set([
+  ...captureStatuses,
+  "rate_limited",
+  "capacity_limited",
+]);
+const deliveryStatuses = new Set([
+  "processing",
+  "awaiting_vault",
+  "awaiting_sync",
+  "synced",
+  "not_applicable",
+]);
+const stableFailureReasons = new Set([
+  "daily_task_limit_reached",
+  "task_allowance_exhausted",
+  "document_output_limit_exceeded",
+  "document_page_limit_exceeded",
+  "file_too_large",
+  "global_queue_full",
+  "membership_file_not_supported",
+  "processing_deadline_exceeded",
+  "processing_failed",
+  "rate_limited",
+  "capacity_limited",
+  "recent_failure_limit_reached",
+]);
 
 class BrainPostError extends Error {
   constructor(code, message, exitCode = 1, details) {
@@ -41,6 +104,8 @@ class BrainPostError extends Error {
 function usage() {
   return `Usage:
   node brainpost.mjs configure [--api URL] < token.txt
+  node brainpost.mjs capabilities
+  node brainpost.mjs status (--intake UUID | --capture UUID)
   node brainpost.mjs capture (--url URL | --file PATH | --stdin) [--idempotency-key UUID]
 `;
 }
@@ -197,6 +262,31 @@ function configurationRequired() {
   );
 }
 
+function safeErrorDetails(value) {
+  if (!value || typeof value !== "object") return undefined;
+  const details = {};
+  if (Number.isSafeInteger(value.maxFileBytes) && value.maxFileBytes >= 0) {
+    details.maxFileBytes = value.maxFileBytes;
+  }
+  return Object.keys(details).length ? details : undefined;
+}
+
+function safeErrorMessage(code) {
+  return (
+    {
+      daily_task_limit_reached: `BrainPost allowance is exhausted. Open membership: ${membershipUrl}`,
+      task_allowance_exhausted: `BrainPost allowance is exhausted. Open membership: ${membershipUrl}`,
+      file_too_large: "The file exceeds the current BrainPost limit.",
+      global_queue_full: "BrainPost is currently at processing capacity.",
+      membership_file_not_supported: `File organization is a Pro benefit. Open membership: ${membershipUrl}`,
+      processing_deadline_exceeded:
+        "BrainPost processing exceeded its deadline.",
+      recent_failure_limit_reached:
+        "BrainPost temporarily paused new tasks after repeated failures.",
+    }[code] ?? "BrainPost rejected the request."
+  );
+}
+
 async function request(config, path, init = {}) {
   let response;
   try {
@@ -216,11 +306,18 @@ async function request(config, path, init = {}) {
   }
   const value = await response.json().catch(() => null);
   if (!response.ok) {
+    const code = value?.error?.code ?? "api_error";
     throw new BrainPostError(
-      value?.error?.code ?? "api_error",
-      value?.error?.message ?? "BrainPost rejected the request.",
-      5,
-      value?.error?.details,
+      code,
+      safeErrorMessage(code),
+      [
+        "invalid_file_artifact",
+        "file_artifact_mismatch",
+        "file_artifact_expired",
+      ].includes(code)
+        ? 4
+        : 5,
+      safeErrorDetails(value?.error?.details),
     );
   }
   return value;
@@ -249,6 +346,170 @@ async function defaultVault(config) {
   };
 }
 
+async function membershipCapabilities(config) {
+  const value = await request(config, "/v1/account/capabilities");
+  const membership = value?.membership;
+  const purchase = membership?.purchase;
+  const plans = purchase?.plans;
+  if (
+    !["free", "premium", "pro"].includes(membership?.tier) ||
+    typeof membership?.policyVersion !== "string" ||
+    !membership.policyVersion ||
+    !["sufficient", "running_low", "exhausted"].includes(
+      membership?.allowanceState,
+    ) ||
+    (membership.usageMultiplier !== null &&
+      (!Number.isSafeInteger(membership.usageMultiplier) ||
+        membership.usageMultiplier < 1)) ||
+    typeof membership.legacyTerm !== "boolean" ||
+    typeof membership.fileIntakeEnabled !== "boolean" ||
+    !Number.isSafeInteger(membership.maxFileBytes) ||
+    membership.maxFileBytes < 1 ||
+    (membership.termExpiresAt !== null &&
+      (typeof membership.termExpiresAt !== "string" ||
+        Number.isNaN(Date.parse(membership.termExpiresAt)))) ||
+    typeof purchase?.enabled !== "boolean" ||
+    !Array.isArray(plans) ||
+    plans.length !== 2 ||
+    !plans.every(
+      (plan) =>
+        ["premium", "pro"].includes(plan?.tier) &&
+        Number.isSafeInteger(plan.amountCents) &&
+        plan.amountCents > 0 &&
+        (plan.action === null ||
+          ["open", "upgrade", "reopen", "renew", "resume"].includes(
+            plan.action,
+          )),
+    )
+  ) {
+    throw new BrainPostError(
+      "invalid_response",
+      "BrainPost returned invalid membership capabilities.",
+      5,
+    );
+  }
+  const recoveryPlan = purchase.enabled
+    ? plans.find((plan) => plan.action !== null)
+    : null;
+  const recovery =
+    membership.allowanceState === "exhausted" && recoveryPlan
+      ? { action: recoveryPlan.action, url: membershipUrl }
+      : null;
+  return {
+    tier: membership.tier,
+    allowanceState: membership.allowanceState,
+    usageMultiplier: membership.usageMultiplier,
+    legacyTerm: membership.legacyTerm,
+    fileIntakeEnabled: membership.fileIntakeEnabled,
+    maxFileBytes: membership.maxFileBytes,
+    termExpiresAt: membership.termExpiresAt,
+    purchaseEnabled: purchase.enabled,
+    ...(recovery ? { recovery } : {}),
+  };
+}
+
+async function enrichAllowanceError(error, config) {
+  if (
+    !(error instanceof BrainPostError) ||
+    !["daily_task_limit_reached", "task_allowance_exhausted"].includes(
+      error.code,
+    )
+  ) {
+    return error;
+  }
+  const membership = await membershipCapabilities(config).catch(() => null);
+  if (!membership) return error;
+  error.details = {
+    ...error.details,
+    membership,
+    ...(membership.recovery ? { recovery: membership.recovery } : {}),
+  };
+  error.message = membership.recovery
+    ? membership.tier === "free"
+      ? `BrainPost trial allowance is exhausted. Open Advanced or Pro: ${membershipUrl}`
+      : membership.tier === "premium"
+        ? `BrainPost Advanced allowance is exhausted. Upgrade to Pro: ${membershipUrl}`
+        : `BrainPost Pro allowance is exhausted. Reopen Pro: ${membershipUrl}`
+    : "BrainPost allowance is exhausted. Membership purchase is currently unavailable.";
+  return error;
+}
+
+async function showCapabilities(configPath) {
+  const config = (await loadConfig(configPath)) ?? configurationRequired();
+  process.stdout.write(
+    `${JSON.stringify({ ok: true, membership: await membershipCapabilities(config) })}\n`,
+  );
+}
+
+function stableReason(value, fallback) {
+  return value === null
+    ? null
+    : typeof value === "string" && stableFailureReasons.has(value)
+      ? value
+      : fallback;
+}
+
+async function showStatus(args, configPath) {
+  const parsed = options(args, new Set(["--intake", "--capture"]));
+  const modes = ["--intake", "--capture"].filter((name) => parsed.has(name));
+  if (modes.length !== 1 || !uuid.test(parsed.get(modes[0]) ?? "")) {
+    throw new BrainPostError(
+      "usage_error",
+      "Choose one valid Intake or Capture UUID.",
+      2,
+    );
+  }
+  const kind = modes[0] === "--capture" ? "capture" : "intake";
+  const id = parsed.get(modes[0]);
+  const config = (await loadConfig(configPath)) ?? configurationRequired();
+  const value = await request(config, `/v1/${kind}s/${id}`);
+  if (kind === "capture") {
+    if (value?.id !== id || !captureStatuses.has(value?.status)) {
+      throw new BrainPostError(
+        "invalid_response",
+        "BrainPost returned an invalid Capture status.",
+        5,
+      );
+    }
+    process.stdout.write(
+      `${JSON.stringify({
+        ok: true,
+        capture: {
+          id,
+          status: value.status,
+          failureReason: stableReason(value.failureReason, "processing_failed"),
+        },
+      })}\n`,
+    );
+    return;
+  }
+  if (
+    value?.id !== id ||
+    !intakeStatuses.has(value?.status) ||
+    !deliveryStatuses.has(value?.deliveryStatus) ||
+    typeof value?.retryable !== "boolean"
+  ) {
+    throw new BrainPostError(
+      "invalid_response",
+      "BrainPost returned an invalid Intake status.",
+      5,
+    );
+  }
+  process.stdout.write(
+    `${JSON.stringify({
+      ok: true,
+      intake: {
+        id,
+        status: value.status,
+        failureReason: stableReason(value.failureReason, "processing_failed"),
+        refusalReason: stableReason(value.refusalReason, "refused"),
+        deliveryStatus: value.deliveryStatus,
+        retryable: value.retryable,
+      },
+    })}\n`,
+  );
+}
+
 async function configure(args, configPath) {
   const parsed = options(args, new Set(["--api"]));
   const apiUrl = apiBase(
@@ -258,18 +519,124 @@ async function configure(args, configPath) {
   );
   const token = identityToken((await readStdin(512)).trim());
   const vault = await defaultVault({ apiUrl, token });
-  if (!vault) {
-    throw new BrainPostError(
-      "default_vault_required",
-      "Open and authenticate an Obsidian Vault before submitting content.",
-      3,
-      { setupUrl: `${apiUrl.replace(/\/api$/u, "")}/#account` },
-    );
-  }
   await saveConfig(configPath, { apiUrl, token });
   process.stdout.write(
-    `${JSON.stringify({ ok: true, config: { apiUrl, defaultVault: vault.projectName, tokenConfigured: true } })}\n`,
+    `${JSON.stringify({ ok: true, config: { apiUrl, defaultVault: vault?.projectName ?? null, pendingDelivery: !vault, tokenConfigured: true } })}\n`,
   );
+}
+
+async function submitDocumentFile(config, path, idempotencyKey) {
+  if (!isAbsolute(path)) {
+    throw new BrainPostError(
+      "input_error",
+      "Document path must be absolute.",
+      4,
+    );
+  }
+  const filename = basename(path);
+  const extension = extname(filename).toLowerCase();
+  if (!documentExtensions.has(extension)) {
+    throw new BrainPostError(
+      "input_error",
+      "File type is not supported for document conversion.",
+      4,
+    );
+  }
+  let details;
+  try {
+    details = await stat(path);
+  } catch {
+    throw new BrainPostError("input_error", "Document could not be read.", 4);
+  }
+  if (!details.isFile() || details.size < 1) {
+    throw new BrainPostError(
+      "input_error",
+      "Document must be a non-empty regular file.",
+      4,
+    );
+  }
+  const mediaType = mediaTypes[extension] ?? "application/octet-stream";
+  try {
+    const membership = await membershipCapabilities(config);
+    if (!membership.fileIntakeEnabled) {
+      throw new BrainPostError(
+        "membership_file_not_supported",
+        `File organization is a Pro benefit. Open membership: ${membershipUrl}`,
+        5,
+        { membership },
+      );
+    }
+    if (details.size > membership.maxFileBytes) {
+      throw new BrainPostError(
+        "file_too_large",
+        "Document exceeds the current BrainPost file limit.",
+        4,
+        { membership },
+      );
+    }
+    const bytes = await readFile(path).catch(() => {
+      throw new BrainPostError("input_error", "Document could not be read.", 4);
+    });
+    const authorization = await request(config, "/v1/file-intakes", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "idempotency-key": idempotencyKey,
+      },
+      body: JSON.stringify({
+        filename,
+        mediaType,
+        byteSize: bytes.length,
+        sha256: createHash("sha256").update(bytes).digest("hex"),
+      }),
+    });
+    if (
+      !uuid.test(authorization?.id ?? "") ||
+      authorization?.uploadPath !== `/v1/file-uploads/${authorization.id}`
+    ) {
+      throw new BrainPostError(
+        "invalid_response",
+        "BrainPost returned an invalid file authorization.",
+        5,
+      );
+    }
+    await request(config, authorization.uploadPath, {
+      method: "PUT",
+      headers: { "content-type": mediaType },
+      body: bytes,
+    });
+    const capture = await request(
+      config,
+      `/v1/file-intakes/${authorization.id}/commit`,
+      {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "idempotency-key": idempotencyKey,
+        },
+        body: JSON.stringify({ client: "skill" }),
+      },
+    );
+    if (
+      !uuid.test(capture?.id ?? "") ||
+      !captureStatuses.has(capture?.status)
+    ) {
+      throw new BrainPostError(
+        "invalid_response",
+        "BrainPost returned an invalid file Capture.",
+        5,
+      );
+    }
+    process.stdout.write(
+      `${JSON.stringify({ ok: true, file: { captureId: capture.id, filename, status: capture.status } })}\n`,
+    );
+  } catch (error) {
+    error = await enrichAllowanceError(error, config);
+    if (error instanceof BrainPostError) {
+      error.details = { ...error.details, idempotencyKey };
+    }
+    throw error;
+  }
 }
 
 async function capture(args, configPath) {
@@ -289,6 +656,15 @@ async function capture(args, configPath) {
     );
   }
   const config = (await loadConfig(configPath)) ?? configurationRequired();
+  const suppliedKey = parsed.get("--idempotency-key");
+  if (suppliedKey !== undefined && !uuid.test(suppliedKey)) {
+    throw new BrainPostError(
+      "usage_error",
+      "Idempotency key must be a UUID.",
+      2,
+    );
+  }
+  const idempotencyKey = suppliedKey ?? randomUUID();
 
   let body;
   if (parsed.has("--url")) {
@@ -305,6 +681,23 @@ async function capture(args, configPath) {
     let content;
     if (parsed.has("--file")) {
       const path = parsed.get("--file");
+      if (documentExtensions.has(extname(path).toLowerCase())) {
+        return submitDocumentFile(config, path, idempotencyKey);
+      }
+      if (!isAbsolute(path)) {
+        throw new BrainPostError(
+          "input_error",
+          "Markdown path must be absolute.",
+          4,
+        );
+      }
+      if (![".md", ".markdown"].includes(extname(path).toLowerCase())) {
+        throw new BrainPostError(
+          "input_error",
+          "Use --file with Markdown or a supported document type.",
+          4,
+        );
+      }
       let details;
       try {
         details = await stat(path);
@@ -349,15 +742,6 @@ async function capture(args, configPath) {
     };
   }
 
-  const suppliedKey = parsed.get("--idempotency-key");
-  if (suppliedKey !== undefined && !uuid.test(suppliedKey)) {
-    throw new BrainPostError(
-      "usage_error",
-      "Idempotency key must be a UUID.",
-      2,
-    );
-  }
-  const idempotencyKey = suppliedKey ?? randomUUID();
   let value;
   try {
     value = await request(config, "/v1/intakes", {
@@ -369,6 +753,7 @@ async function capture(args, configPath) {
       body: JSON.stringify(body),
     });
   } catch (error) {
+    error = await enrichAllowanceError(error, config);
     if (error instanceof BrainPostError) {
       error.details = { ...error.details, idempotencyKey };
     }
@@ -396,6 +781,9 @@ async function main(args) {
     join(homedir(), ".config", "brainpost", "config.json");
   const [command, ...rest] = args;
   if (command === "configure") return configure(rest, configPath);
+  if (command === "capabilities" && rest.length === 0)
+    return showCapabilities(configPath);
+  if (command === "status") return showStatus(rest, configPath);
   if (command === "capture") return capture(rest, configPath);
   if (command === "help" || command === "--help" || command === undefined) {
     process.stdout.write(usage());

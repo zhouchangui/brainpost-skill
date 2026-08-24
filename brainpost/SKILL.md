@@ -1,6 +1,6 @@
 ---
 name: brainpost
-description: Save URLs, plain text, or complete Markdown files to a BrainPost Vault. Use when the user asks to submit, post, capture, collect, archive, or save content through BrainPost.
+description: Save URLs, plain text, Markdown, or local documents to a BrainPost Vault. Use when the user asks to submit, post, capture, collect, archive, convert, or save content through BrainPost.
 ---
 
 # BrainPost
@@ -11,8 +11,11 @@ Set `<skill-dir>` to the directory containing this `SKILL.md`, then choose exact
 
 ```text
 node <skill-dir>/scripts/brainpost.mjs capture --url <URL>
-node <skill-dir>/scripts/brainpost.mjs capture --file <absolute-markdown-path>
+node <skill-dir>/scripts/brainpost.mjs capture --file <absolute-file-path>
 node <skill-dir>/scripts/brainpost.mjs capture --stdin
+node <skill-dir>/scripts/brainpost.mjs capabilities
+node <skill-dir>/scripts/brainpost.mjs status --intake <UUID>
+node <skill-dir>/scripts/brainpost.mjs status --capture <UUID>
 ```
 
 Pass `--stdin` content through process stdin. All submissions use the Owner's current default Obsidian Vault.
@@ -29,12 +32,15 @@ node <skill-dir>/scripts/brainpost.mjs configure
 
 The MVP intentionally shares this one Token with every BrainPost channel. Never issue, rotate, revoke, transform, or commit it. The script stores it at `~/.config/brainpost/config.json` with mode `0600`.
 
-If configuration returns `default_vault_required`, show the setup URL and ask the user to open and authenticate an Obsidian Vault before retrying.
+If no Vault is connected yet, configuration succeeds with `pendingDelivery: true`; submitted content waits in the Pending Delivery Project and is delivered after the first Vault activation.
 
 ## Submission rules
 
-- Upload a Markdown file with `--file`; preserve its complete contents as the Intake source. The API accepts valid UTF-8 files up to 262,144 bytes.
+- Use `--file` with an absolute path. Markdown (`.md`, `.markdown`) is preserved as Intake text up to 262,144 UTF-8 bytes.
+- Word, PDF, PowerPoint, Excel, OpenDocument, RTF, EPUB and CSV files use private File Intake only when the Platform reports `membership.fileIntakeEnabled`; this is currently a Pro benefit. Keep files within `membership.maxFileBytes`. Query `capabilities` when the user asks about membership or allowance state. The receipt reports only Capture ID, filename and status; it never prints file bytes, Token, object keys or temporary URLs.
 - Use `--stdin` for plain text and `--url` for HTTP(S) links.
-- Report the returned Intake ID, status and status URL.
+- Report the returned Intake ID/status/status URL for text and links, or Capture ID/filename/status for documents.
+- Use `status --intake <UUID>` for a URL/text Intake or `status --capture <UUID>` for a document receipt when the user asks for the asynchronous result; report the returned stable failure reason without exposing source data.
 - On a retryable failure, reuse `error.details.idempotencyKey` with `--idempotency-key <UUID>`.
+- Preserve stable error codes when explaining a rejection. Treat `task_allowance_exhausted` and the migration alias `daily_task_limit_reached` as the same fixed-term exhaustion result, use the returned recovery action and `https://brainpost.me/account.html#membership`, and never describe a daily reset. Do not infer task limits locally.
 - Never print the config file or Token.

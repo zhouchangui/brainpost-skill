@@ -2,7 +2,7 @@
 
 ## Project overview
 
-This public repository contains the installable `brainpost` Agent Skill. It submits URLs, plain text, and complete Markdown files to the BrainPost API. The installable package is `brainpost/`; repository-only tests and documentation stay at the root.
+This public repository contains the installable `brainpost` Agent Skill. It submits URLs, plain text, complete Markdown, and supported local documents to the BrainPost API. The installable package is `brainpost/`; repository-only tests and documentation stay at the root.
 
 ## Boundaries
 
