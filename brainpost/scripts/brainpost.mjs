@@ -14,7 +14,7 @@ import { homedir } from "node:os";
 import { basename, dirname, extname, isAbsolute, join } from "node:path";
 
 const maxContentBytes = 262_144;
-const membershipUrl = "https://brainpost.me/account.html#membership";
+const pointsUrl = "https://brainpost.me/account.html#points";
 const documentExtensions = new Set([
   ".csv",
   ".doc",
@@ -85,6 +85,7 @@ const stableFailureReasons = new Set([
   "file_too_large",
   "global_queue_full",
   "membership_file_not_supported",
+  "points_insufficient",
   "processing_deadline_exceeded",
   "processing_failed",
   "rate_limited",
@@ -274,11 +275,11 @@ function safeErrorDetails(value) {
 function safeErrorMessage(code) {
   return (
     {
-      daily_task_limit_reached: `BrainPost allowance is exhausted. Open membership: ${membershipUrl}`,
-      task_allowance_exhausted: `BrainPost allowance is exhausted. Open membership: ${membershipUrl}`,
+      daily_task_limit_reached: `BrainPost points are insufficient. Buy points: ${pointsUrl}`,
+      task_allowance_exhausted: `BrainPost points are insufficient. Buy points: ${pointsUrl}`,
       file_too_large: "The file exceeds the current BrainPost limit.",
       global_queue_full: "BrainPost is currently at processing capacity.",
-      membership_file_not_supported: `File organization is a Pro benefit. Open membership: ${membershipUrl}`,
+      membership_file_not_supported: `File organization requires points. Buy points: ${pointsUrl}`,
       processing_deadline_exceeded:
         "BrainPost processing exceeded its deadline.",
       recent_failure_limit_reached:
@@ -346,98 +347,70 @@ async function defaultVault(config) {
   };
 }
 
-async function membershipCapabilities(config) {
+async function pointsCapabilities(config) {
   const value = await request(config, "/v1/account/capabilities");
-  const membership = value?.membership;
-  const purchase = membership?.purchase;
-  const plans = purchase?.plans;
+  const points = value?.points;
+  const purchase = points?.purchase;
   if (
-    !["free", "premium", "pro"].includes(membership?.tier) ||
-    typeof membership?.policyVersion !== "string" ||
-    !membership.policyVersion ||
-    !["sufficient", "running_low", "exhausted"].includes(
-      membership?.allowanceState,
-    ) ||
-    (membership.usageMultiplier !== null &&
-      (!Number.isSafeInteger(membership.usageMultiplier) ||
-        membership.usageMultiplier < 1)) ||
-    typeof membership.legacyTerm !== "boolean" ||
-    typeof membership.fileIntakeEnabled !== "boolean" ||
-    !Number.isSafeInteger(membership.maxFileBytes) ||
-    membership.maxFileBytes < 1 ||
-    (membership.termExpiresAt !== null &&
-      (typeof membership.termExpiresAt !== "string" ||
-        Number.isNaN(Date.parse(membership.termExpiresAt)))) ||
-    typeof purchase?.enabled !== "boolean" ||
-    !Array.isArray(plans) ||
-    plans.length !== 2 ||
-    !plans.every(
-      (plan) =>
-        ["premium", "pro"].includes(plan?.tier) &&
-        Number.isSafeInteger(plan.amountCents) &&
-        plan.amountCents > 0 &&
-        (plan.action === null ||
-          ["open", "upgrade", "reopen", "renew", "resume"].includes(
-            plan.action,
-          )),
+    !points ||
+    !Number.isSafeInteger(points.available) ||
+    points.available < 0 ||
+    !Number.isSafeInteger(points.reserved) ||
+    points.reserved < 0 ||
+    !purchase ||
+    typeof purchase.enabled !== "boolean" ||
+    !Array.isArray(purchase.packs) ||
+    !purchase.packs.every(
+      (pack) =>
+        typeof pack?.id === "string" &&
+        Number.isSafeInteger(pack.points) &&
+        pack.points > 0,
     )
   ) {
     throw new BrainPostError(
       "invalid_response",
-      "BrainPost returned invalid membership capabilities.",
+      "BrainPost returned invalid points capabilities.",
       5,
     );
   }
-  const recoveryPlan = purchase.enabled
-    ? plans.find((plan) => plan.action !== null)
-    : null;
-  const recovery =
-    membership.allowanceState === "exhausted" && recoveryPlan
-      ? { action: recoveryPlan.action, url: membershipUrl }
-      : null;
   return {
-    tier: membership.tier,
-    allowanceState: membership.allowanceState,
-    usageMultiplier: membership.usageMultiplier,
-    legacyTerm: membership.legacyTerm,
-    fileIntakeEnabled: membership.fileIntakeEnabled,
-    maxFileBytes: membership.maxFileBytes,
-    termExpiresAt: membership.termExpiresAt,
+    available: points.available,
+    reserved: points.reserved,
+    taskCosts: points.taskCosts,
+    maxFileBytes: 52_428_800,
     purchaseEnabled: purchase.enabled,
-    ...(recovery ? { recovery } : {}),
+    recovery: purchase.enabled ? { url: pointsUrl } : null,
   };
 }
 
 async function enrichAllowanceError(error, config) {
   if (
     !(error instanceof BrainPostError) ||
-    !["daily_task_limit_reached", "task_allowance_exhausted"].includes(
-      error.code,
-    )
+    ![
+      "daily_task_limit_reached",
+      "task_allowance_exhausted",
+      "points_insufficient",
+    ].includes(error.code)
   ) {
     return error;
   }
-  const membership = await membershipCapabilities(config).catch(() => null);
-  if (!membership) return error;
+  const points = await pointsCapabilities(config).catch(() => null);
+  if (!points) return error;
   error.details = {
     ...error.details,
-    membership,
-    ...(membership.recovery ? { recovery: membership.recovery } : {}),
+    points,
+    ...(points.recovery ? { recovery: points.recovery } : {}),
   };
-  error.message = membership.recovery
-    ? membership.tier === "free"
-      ? `BrainPost trial allowance is exhausted. Open Advanced or Pro: ${membershipUrl}`
-      : membership.tier === "premium"
-        ? `BrainPost Advanced allowance is exhausted. Upgrade to Pro: ${membershipUrl}`
-        : `BrainPost Pro allowance is exhausted. Reopen Pro: ${membershipUrl}`
-    : "BrainPost allowance is exhausted. Membership purchase is currently unavailable.";
+  error.message = points.recovery
+    ? `BrainPost points are insufficient. Buy points: ${pointsUrl}`
+    : "BrainPost points are insufficient. Point purchase is currently unavailable.";
   return error;
 }
 
 async function showCapabilities(configPath) {
   const config = (await loadConfig(configPath)) ?? configurationRequired();
   process.stdout.write(
-    `${JSON.stringify({ ok: true, membership: await membershipCapabilities(config) })}\n`,
+    `${JSON.stringify({ ok: true, points: await pointsCapabilities(config) })}\n`,
   );
 }
 
@@ -557,21 +530,21 @@ async function submitDocumentFile(config, path, idempotencyKey) {
   }
   const mediaType = mediaTypes[extension] ?? "application/octet-stream";
   try {
-    const membership = await membershipCapabilities(config);
-    if (!membership.fileIntakeEnabled) {
+    const points = await pointsCapabilities(config);
+    if (points.available < points.taskCosts.file) {
       throw new BrainPostError(
-        "membership_file_not_supported",
-        `File organization is a Pro benefit. Open membership: ${membershipUrl}`,
+        "points_insufficient",
+        `File organization requires ${points.taskCosts.file} points. Buy points: ${pointsUrl}`,
         5,
-        { membership },
+        { points },
       );
     }
-    if (details.size > membership.maxFileBytes) {
+    if (details.size > points.maxFileBytes) {
       throw new BrainPostError(
         "file_too_large",
         "Document exceeds the current BrainPost file limit.",
         4,
-        { membership },
+        { points },
       );
     }
     const bytes = await readFile(path).catch(() => {

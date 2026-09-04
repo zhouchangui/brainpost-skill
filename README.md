@@ -10,9 +10,9 @@ npx skills add zhouchangui/brainpost-skill
 
 Then ask your agent to save something with `$brainpost`. There is no standalone or global CLI; the installed Skill runs its bundled script.
 
-On first use, BrainPost opens the account page and asks for the existing shared Identity Token. The agent stores it locally in `~/.config/brainpost/config.json`. If no Vault is connected yet, submissions safely wait until the first Vault is activated. Complete Markdown is supported up to 256 KiB; eligible memberships can privately upload supported Word, PDF, presentation, spreadsheet, OpenDocument, RTF, EPUB and CSV files within the current Platform limit.
+On first use, BrainPost opens the account page and asks for the existing shared Identity Token. The agent stores it locally in `~/.config/brainpost/config.json`. If no Vault is connected yet, submissions safely wait until the first Vault is activated. Complete Markdown is supported up to 256 KiB; available points can privately upload supported Word, PDF, presentation, spreadsheet, OpenDocument, RTF, EPUB and CSV files within the current Platform limit.
 
-The bundled script can report the current membership, completed and active tasks, remaining allowance, file capability, effective file limit and next reset without embedding the tier matrix:
+The bundled script can report the current points balance, reserved points, task costs and purchase options without embedding the tier matrix:
 
 ```bash
 node brainpost/scripts/brainpost.mjs capabilities
